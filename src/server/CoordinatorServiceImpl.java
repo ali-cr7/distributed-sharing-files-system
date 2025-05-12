@@ -3,13 +3,13 @@ package server;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorService {
@@ -31,11 +31,35 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
     }
 
     @Override
-    public boolean registerUser(String username, String password, String role, String department) throws RemoteException {
+    public boolean registerUser(String token, String username, String password, String role, String department) throws RemoteException {
+        // Allow creation of default admin
+        if (users.isEmpty() && username.equals("admin") && role.equals("manager")) {
+            users.put(username, new User(username, password, role, department));
+            return true;
+        }
+        // Validate department
+        List<String> allowedDepartments = List.of("QA", "Graphic", "Development","general");
+      if (!allowedDepartments.contains(department)) return false;
+
+
+
+
+        // Token validation
+        String requester = activeTokens.get(token);
+        if (requester == null) return false;
+
+        User currentUser = users.get(requester);
+        if (currentUser == null || !currentUser.role.equals("manager")) {
+            return false;
+        }
+
+        // Username must be unique
         if (users.containsKey(username)) return false;
+
         users.put(username, new User(username, password, role, department));
         return true;
     }
+
 
     @Override
     public String login(String username, String password) throws RemoteException {
@@ -53,7 +77,7 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         User user = users.get(username);
         if (user == null) return false;
         if (user.role.equals("manager")) return true;
-        return user.department.equals(department) && List.of("add", "edit", "delete").contains(action);
+        return user.department.equals(department) && List.of("add", "edit", "delete","view").contains(action);
     }
 
     @Override
@@ -95,29 +119,65 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
     }
     @Override
     public byte[] requestFile(String token, String filename, String department) throws RemoteException {
+        // Add permission check first
+        if (!hasPermission(token, "view", department)) {
+            System.out.println("[COORDINATOR] Permission denied for " + department);
+            return null;
+        }
+
         for (int i = 0; i < nodeAddresses.size(); i++) {
-            String nodeHost = nodeAddresses.get(i);
+            String host = nodeAddresses.get(i);
             int port = nodePorts.get(i);
 
-            try (Socket socket = new Socket(nodeHost, port);
-                 ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-                 ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(host, port), 3000);
+                socket.setSoTimeout(3000);
+
+                // Initialize output stream first!
+                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                out.flush(); // Important to flush header
+
+                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
                 out.writeUTF("fetch");
                 out.writeUTF(department);
                 out.writeUTF(filename);
                 out.flush();
 
-                Object obj = in.readObject();
-                if (obj instanceof byte[]) {
-                    return (byte[]) obj;
+                byte[] data = (byte[]) in.readObject();
+                if (data != null && data.length > 0) {
+                    return data;
                 }
-
             } catch (Exception e) {
-                e.printStackTrace();
+                System.out.println("[COORDINATOR] Node " + i + " error: " + e.getMessage());
             }
         }
-        return null;
+        return new byte[0];
+    }
+    @Override
+    public List<String> listFiles(String token, String department) throws RemoteException {
+        Set<String> uniqueFiles = new HashSet<>();
+
+        for (int i = 0; i < nodeAddresses.size(); i++) {
+            try (Socket socket = new Socket(nodeAddresses.get(i), nodePorts.get(i))) {
+                // Initialize output stream FIRST
+                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                out.flush();
+
+                // Then input stream
+                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+
+                out.writeUTF("list");
+                out.writeUTF(department);
+                out.flush();
+
+                List<String> nodeFiles = (List<String>) in.readObject();
+                uniqueFiles.addAll(nodeFiles);
+            } catch (Exception e) {
+                System.err.println("Error querying node " + (i+1) + ": " + e.getMessage());
+            }
+        }
+        return new ArrayList<>(uniqueFiles);
     }
 }
 
