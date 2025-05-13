@@ -140,9 +140,11 @@ class FileNodeServer {
         try (FileOutputStream fos = new FileOutputStream(file)) {
             fos.write(content);
             out.writeBoolean(true);
+            out.flush();
             System.out.println("[NODE] File " + filename + " saved successfully");
         } catch (IOException e) {
             out.writeBoolean(false);
+            out.flush();
             System.out.println("[NODE] Error saving file: " + e.getMessage());
         }
     }
@@ -170,9 +172,13 @@ class FileNodeServer {
                 byte[] data = Files.readAllBytes(targetFile.toPath());
                 System.out.println("[NODE] Sending " + data.length + " bytes");
                 out.writeObject(data);
+                out.writeBoolean(true);
+                out.flush();
             } catch (IOException e) {
                 System.out.println("[NODE] Read error: " + e.getMessage());
                 out.writeObject(new byte[0]);
+                out.writeBoolean(false);
+                out.flush();
             }
         } else {
             System.out.println("[NODE] File not found");

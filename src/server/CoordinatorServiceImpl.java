@@ -96,8 +96,9 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             out.writeUTF(department);
             out.writeUTF(filename);
             out.writeObject(content);
-
             return in.readBoolean();
+
+
         } catch (IOException e) {
             e.printStackTrace();
             return false;
