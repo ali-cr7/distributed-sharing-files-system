@@ -187,11 +187,87 @@ class FileNodeServer {
     }
 
     public static void main(String[] args) {
-        // Use consistent port numbers (5001-5003)
-        new Thread(() -> startNode(5001, "node1")).start();
-        new Thread(() -> startNode(5002, "node2")).start();
-        new Thread(() -> startNode(5003, "node3")).start();
+        var nodeThreads = new java.util.HashMap<Integer, Thread>();
+        var activePorts = List.of(5001, 5002, 5003);
+
+        // Start all three nodes at the beginning
+        for (int i = 0; i < activePorts.size(); i++) {
+            int port = activePorts.get(i);
+            int nodeNum = i + 1;
+            Thread t = new Thread(() -> startNode(port, "node" + nodeNum));
+            t.start();
+            nodeThreads.put(port, t);
+            System.out.println("Node " + nodeNum + " started on port " + port);
+        }
+
+        java.util.Scanner scanner = new java.util.Scanner(System.in);
+
+        while (true) {
+            System.out.println("\n=== File Node Controller ===");
+            System.out.println("1) Start node");
+            System.out.println("2) Stop node");
+            System.out.println("3) List active nodes");
+            System.out.println("0) Exit");
+            System.out.print("Choose: ");
+            String choice = scanner.nextLine();
+
+            switch (choice) {
+                case "1" -> {
+                    System.out.print("Enter node number (1-3): ");
+                    int num = Integer.parseInt(scanner.nextLine());
+                    if (num < 1 || num > 3) {
+                        System.out.println("Invalid node number.");
+                        continue;
+                    }
+                    int port = activePorts.get(num - 1);
+                    if (nodeThreads.containsKey(port)) {
+                        System.out.println("Node " + num + " is already running.");
+                        continue;
+                    }
+                    Thread t = new Thread(() -> startNode(port, "node" + num));
+                    t.start();
+                    nodeThreads.put(port, t);
+                    System.out.println("Node " + num + " started.");
+                }
+
+                case "2" -> {
+                    System.out.print("Enter node number (1-3): ");
+                    int num = Integer.parseInt(scanner.nextLine());
+                    int port = activePorts.get(num - 1);
+                    Thread t = nodeThreads.get(port);
+                    if (t != null) {
+                        t.interrupt();
+                        nodeThreads.remove(port);
+                        System.out.println("Node " + num + " stopped.");
+                    } else {
+                        System.out.println("Node " + num + " is not running.");
+                    }
+                }
+
+                case "3" -> {
+                    System.out.println("Active Nodes:");
+                    for (var entry : nodeThreads.entrySet()) {
+                        System.out.println(" - Node on port " + entry.getKey() + " is running.");
+                    }
+                    if (nodeThreads.isEmpty()) {
+                        System.out.println("No active nodes.");
+                    }
+                }
+
+                case "0" -> {
+                    System.out.println("Shutting down all nodes...");
+                    for (Thread t : nodeThreads.values()) {
+                        t.interrupt();
+                    }
+                    return;
+                }
+
+                default -> System.out.println("Invalid choice.");
+            }
+        }
     }
+
+
 
     private static void startNode(int port, String name) {
         try {

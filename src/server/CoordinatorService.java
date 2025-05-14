@@ -13,6 +13,8 @@ public interface CoordinatorService extends Remote {
     List<String> listUsers(String token) throws RemoteException;
     byte[]  requestFile(String token, String filename, String department) throws RemoteException;
     List<String> listFiles(String token, String department) throws RemoteException;
+    void simulateLoadOnNode(int nodeIndex, int loadAmount) throws RemoteException;
+    void setNodeStatus(int nodeIndex, boolean isActive) throws RemoteException;
 
 }
 

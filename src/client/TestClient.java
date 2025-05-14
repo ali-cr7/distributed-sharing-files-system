@@ -42,6 +42,7 @@ public class TestClient {
 
             // Main application loop
             while (true) {
+
                 System.out.println("\n===== Main Menu ===== [" + currentUsername + " - " + currentRole + "]");
                 System.out.println("1) File Operations");
                 System.out.println("2) Download File");
@@ -49,6 +50,8 @@ public class TestClient {
                 if (currentRole.equals("manager")) {
                     System.out.println("3) User Management");
                     System.out.println("4) List All Users");
+                    System.out.println("5) Simulate Load on Node");
+                    System.out.println("6) Toggle Node On/Off");
                 }
 
                 System.out.println("0) Logout");
@@ -79,6 +82,17 @@ public class TestClient {
                                 listAllUsers(service, token);
                             } else {
                                 System.out.println("Access denied!");
+                            }
+                            break;
+                        case 5:
+                            if (currentRole.equals("manager")) {
+                                simulateLoadOnNode(scanner, service);
+                            }
+                            break;
+
+                        case 6:
+                            if (currentRole.equals("manager")) {
+                                toggleNodeStatus(scanner, service);
                             }
                             break;
 
@@ -214,7 +228,6 @@ public class TestClient {
             System.out.println("Error during download: " + e.getMessage());
         }
     }
-
     private static void handleFileOperations(Scanner scanner, CoordinatorService service, String token) throws Exception {
         System.out.println("\n=== File Operations ===");
         System.out.print("Action (add/edit/delete/list): ");
@@ -238,9 +251,6 @@ public class TestClient {
         boolean result = service.sendFileCommand(token, action, filename, department, content);
         System.out.println(result ? "Operation successful!" : "Operation failed (check permissions)");
     }
-
-
-
     private static void handleUserManagement(Scanner scanner, CoordinatorService service, String token) throws Exception {
         System.out.println("\n=== User Management ===");
         System.out.print("Username: ");
@@ -259,7 +269,6 @@ public class TestClient {
         boolean success = service.registerUser(token, username, password, role, department);
         System.out.println(success ? "User registered successfully!" : "Registration failed!");
     }
-
     private static void listAllUsers(CoordinatorService service, String token) throws Exception {
         System.out.println("\n=== User List ===");
         List<String> users = service.listUsers(token);
@@ -269,4 +278,35 @@ public class TestClient {
             users.forEach(System.out::println);
         }
     }
+    private static void simulateLoadOnNode(Scanner scanner, CoordinatorService service) {
+        try {
+            System.out.print("Enter node index (0-based): ");
+            int nodeIndex = Integer.parseInt(scanner.nextLine());
+
+            System.out.print("Enter load amount to simulate: ");
+            int loadAmount = Integer.parseInt(scanner.nextLine());
+
+            service.simulateLoadOnNode(nodeIndex, loadAmount);
+            System.out.println("Simulated " + loadAmount + " load on node " + nodeIndex);
+        } catch (Exception e) {
+            System.out.println("Failed to simulate load: " + e.getMessage());
+        }
+    }
+    private static void toggleNodeStatus(Scanner scanner, CoordinatorService service) {
+        try {
+            System.out.print("Enter node index (0-based): ");
+            int nodeIndex = Integer.parseInt(scanner.nextLine());
+
+            System.out.print("Enter status (on/off): ");
+            String status = scanner.nextLine().trim().toLowerCase();
+
+            boolean activate = status.equals("on");
+            service.setNodeStatus(nodeIndex, activate);
+
+            System.out.println("Node " + nodeIndex + " is now " + (activate ? "ON" : "OFF"));
+        } catch (Exception e) {
+            System.out.println("Failed to change node status: " + e.getMessage());
+        }
+    }
+
 }
