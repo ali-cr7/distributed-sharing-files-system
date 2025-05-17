@@ -10,6 +10,8 @@ import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorService {
     static class User {
@@ -21,21 +23,33 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
 
     private final Map<String, User> users = new ConcurrentHashMap<>();
     private final Map<String, String> activeTokens = new ConcurrentHashMap<>();
+    private final Map<Integer, Integer> nodeConnections = new ConcurrentHashMap<>();
     private final List<String> nodeAddresses = List.of("localhost", "localhost", "localhost");
     private final List<Integer> nodePorts = List.of(5001, 5002, 5003);
-    private int nodeIndex = 0;
 
     private final Map<String, String> fileLocationMap = new ConcurrentHashMap<>();
     private final Map<Integer, Integer> nodeLoad = new ConcurrentHashMap<>();
     private final Map<Integer, Boolean> nodeStatus = new ConcurrentHashMap<>();
-
+    private final Map<Integer, NodeInfo> nodeInfoMap = new ConcurrentHashMap<>();
+    private final LoadBalancer loadBalancer = new LoadBalancer();
     protected CoordinatorServiceImpl() throws RemoteException {
         super();
-        for (int i = 0; i < nodePorts.size(); i++) {
-            nodeLoad.put(i, 0);
+        initializeNodes();
+    }
+    private void initializeNodes() {
+        List<String> addresses = List.of("localhost", "localhost", "localhost");
+        List<Integer> ports = List.of(5001, 5002, 5003);
+
+        for (int i = 0; i < ports.size(); i++) {
+            nodeInfoMap.put(i, new NodeInfo(
+                    addresses.get(i),
+                    ports.get(i),
+                    new AtomicInteger(0),
+                    true
+            ));
+            loadBalancer.addNode(i);
         }
     }
-
     @Override
     public boolean registerUser(String token, String username, String password, String role, String department) throws RemoteException {
         if (users.isEmpty() && username.equals("admin") && role.equals("manager")) {
@@ -80,7 +94,14 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
     public boolean sendFileCommand(String token, String action, String filename, String department, byte[] content) throws RemoteException {
         if (!hasPermission(token, action, department)) return false;
 
-        int selectedNode = selectBestNode();
+        int selectedNode = getLeastLoadedNode();
+        if (selectedNode == -1) {
+            System.err.println("[COORDINATOR] No active nodes available.");
+            return false;
+        }
+
+        nodeConnections.compute(selectedNode, (k, v) -> v + 1); // track load
+
         String nodeHost = nodeAddresses.get(selectedNode);
         int port = nodePorts.get(selectedNode);
 
@@ -105,23 +126,11 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             e.printStackTrace();
             return false;
         } finally {
-            nodeLoad.computeIfPresent(selectedNode, (k, v) -> Math.max(0, v - 1));
+            nodeConnections.computeIfPresent(selectedNode, (k, v) -> Math.max(0, v - 1));
         }
     }
 
-    @Override
-    public List<String> listUsers(String token) throws RemoteException {
-        String username = activeTokens.get(token);
-        if (username == null) return List.of("Access Denied: Invalid token");
-        User user = users.get(username);
-        if (!"manager".equals(user.role)) return List.of("Access Denied: Not a manager");
 
-        List<String> result = new ArrayList<>();
-        for (User u : users.values()) {
-            result.add("Username: " + u.username + ", Role: " + u.role + ", Department: " + u.department);
-        }
-        return result;
-    }
 
     @Override
     public byte[] requestFile(String token, String filename, String department) throws RemoteException {
@@ -159,8 +168,9 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             }
         }
 
-        // fallback search across all nodes
         for (int i = 0; i < nodeAddresses.size(); i++) {
+            if (!nodeStatus.getOrDefault(i, true)) continue;
+
             String host = nodeAddresses.get(i);
             int port = nodePorts.get(i);
 
@@ -180,7 +190,7 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
 
                 byte[] data = (byte[]) in.readObject();
                 if (data != null && data.length > 0) {
-                    fileLocationMap.put(key, host + ":" + port); // cache for future
+                    fileLocationMap.put(key, host + ":" + port); // cache it
                     return data;
                 }
             } catch (Exception e) {
@@ -190,72 +200,154 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         return new byte[0];
     }
 
+    private int getLeastLoadedNode() {
+        return nodeConnections.entrySet().stream()
+                .filter(entry -> nodeStatus.getOrDefault(entry.getKey(), true))
+                .min(Comparator.comparingInt(Map.Entry::getValue))
+                .map(Map.Entry::getKey)
+                .orElse(-1);
+    }
+
+    @Override
+    public List<String> listUsers(String token) throws RemoteException {
+        String username = activeTokens.get(token);
+        if (username == null) return List.of("Access Denied: Invalid token");
+        User user = users.get(username);
+        if (!"manager".equals(user.role)) return List.of("Access Denied: Not a manager");
+
+        List<String> result = new ArrayList<>();
+        for (User u : users.values()) {
+            result.add("Username: " + u.username + ", Role: " + u.role + ", Department: " + u.department);
+        }
+        return result;
+    }
+
+
     @Override
     public List<String> listFiles(String token, String department) throws RemoteException {
-        Set<String> uniqueFiles = new HashSet<>();
+        if (!hasPermission(token, "view", department)) {
+            return List.of("Permission denied");
+        }
+        long startTime = System.currentTimeMillis();
+// ... make the request ...
+        long responseTime = System.currentTimeMillis() - startTime;
 
-        for (int i = 0; i < nodeAddresses.size(); i++) {
-            try (Socket socket = new Socket(nodeAddresses.get(i), nodePorts.get(i))) {
-                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-                out.flush();
+        int nodeId = loadBalancer.selectNode();
+        loadBalancer.requestCompleted(nodeId, responseTime);
+        System.out.println("selected node " +  nodeId );
+        if (nodeId == -1) return List.of("No available nodes");
 
-                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+        NodeInfo node = nodeInfoMap.get(nodeId);
+        node.activeConnections.incrementAndGet();
 
-                out.writeUTF("list");
-                out.writeUTF(department);
-                out.flush();
+        try (Socket socket = new Socket(node.host, node.port);
+             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+             ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
 
-                List<String> nodeFiles = (List<String>) in.readObject();
-                uniqueFiles.addAll(nodeFiles);
-            } catch (Exception e) {
-                System.err.println("Error querying node " + (i + 1) + ": " + e.getMessage());
+            out.writeUTF("list");
+            out.writeUTF(department);
+            out.flush();
+
+            return (List<String>) in.readObject();
+        } catch (Exception e) {
+            System.err.println("[COORDINATOR] Error listing files: " + e.getMessage());
+            // Mark node as temporarily unavailable
+            loadBalancer.nodeFailed(nodeId);
+            return Collections.emptyList();
+        } finally {
+            node.activeConnections.decrementAndGet();
+            loadBalancer.requestCompleted(nodeId,responseTime);
+        }
+    }
+
+
+    private static class LoadBalancer {
+        private final Map<Integer, NodeStats> nodeStats = new ConcurrentHashMap<>();
+        private final List<Integer> availableNodes = new CopyOnWriteArrayList<>();
+        private final double CONNECTION_WEIGHT = 0.7;
+        private final double RESPONSE_TIME_WEIGHT = 0.3;
+
+        public void addNode(int nodeId) {
+            nodeStats.putIfAbsent(nodeId, new NodeStats());
+            if (!availableNodes.contains(nodeId)) {
+                availableNodes.add(nodeId);
             }
         }
-        return new ArrayList<>(uniqueFiles);
-    }
 
-    private synchronized int selectBestNode() {
-        int attempts = nodeAddresses.size();
-        int startIndex = nodeIndex;
-        int bestIndex = startIndex;
-        int minLoad = Integer.MAX_VALUE;
+        public int selectNode() {
+            if (availableNodes.isEmpty()) {
+                System.out.println("[LoadBalancer] No available nodes!");
+                return -1;
+            }
 
-        for (int i = 0; i < attempts; i++) {
-            int currentIndex = (startIndex + i) % nodeAddresses.size();
-            int load = nodeLoad.getOrDefault(currentIndex, 0);
-            if (load < minLoad) {
-                minLoad = load;
-                bestIndex = currentIndex;
+            int selectedNode = availableNodes.stream()
+                    .min(Comparator.comparingDouble(nodeId -> {
+                        NodeStats stats = nodeStats.get(nodeId);
+                        double score = (stats.activeConnections * CONNECTION_WEIGHT) +
+                                (stats.avgResponseTime * RESPONSE_TIME_WEIGHT);
+                        System.out.printf("[LoadBalancer] Node %d - Connections: %d, Avg Response: %.2fms, Score: %.2f%n",
+                                nodeId, stats.activeConnections, stats.avgResponseTime, score);
+                        return score;
+                    }))
+                    .orElse(-1);
+
+            System.out.printf("[LoadBalancer] Selected node %d for request%n", selectedNode);
+            return selectedNode;
+        }
+
+        public void requestCompleted(int nodeId, long responseTime) {
+            NodeStats stats = nodeStats.get(nodeId);
+            if (stats != null) {
+                stats.completedRequests++;
+                // Update moving average of response time
+                stats.avgResponseTime = (stats.avgResponseTime * stats.completedRequests + responseTime) /
+                        (stats.completedRequests + 1);
             }
         }
 
-        nodeLoad.computeIfPresent(bestIndex, (k, v) -> v + 1);
-        nodeIndex = (bestIndex + 1) % nodeAddresses.size();
-
-        System.out.println("[COORDINATOR] Selected node " + bestIndex + " (Load: " + minLoad + ")");
-        return bestIndex;
-    }
-    @Override
-    public void simulateLoadOnNode(int nodeIndex, int loadAmount) throws RemoteException {
-        if (nodeIndex < 0 || nodeIndex >= nodeLoad.size()) {
-            throw new RemoteException("Invalid node index");
+        public void nodeFailed(int nodeId) {
+            availableNodes.removeIf(id -> id == nodeId);
+            // Schedule re-check after delay
+            new Timer().schedule(new TimerTask() {
+                @Override
+                public void run() {
+                    addNode(nodeId);  // Will add back if not already present
+                }
+            }, 5000); // Retry after 5 seconds
         }
 
-        // Add the load amount to the node's current load
-        nodeLoad.computeIfPresent(nodeIndex, (k, v) -> v + loadAmount);
+        private static class NodeStats {
+            int activeConnections;
+            double avgResponseTime;
+            int completedRequests;
 
-        System.out.println("[COORDINATOR] Simulated load of " + loadAmount + " on node " + nodeIndex + ". Current load: " + nodeLoad.get(nodeIndex));
-    }
-
-    @Override
-    public void setNodeStatus(int nodeIndex, boolean isActive) throws RemoteException {
-        if (nodeIndex < 0 || nodeIndex >= nodeAddresses.size()) {
-            throw new RemoteException("Invalid node index");
+            public NodeStats() {
+                this.activeConnections = 0;
+                this.avgResponseTime = 0;
+                this.completedRequests = 0;
+            }
         }
-
-        nodeStatus.put(nodeIndex, isActive);
-        String status = isActive ? "active" : "inactive";
-        System.out.println("[COORDINATOR] Node " + nodeIndex + " is now " + status);
     }
 
+    private static class NodeStats {
+        int completedRequests;
+        double avgResponseTime;
+        int activeConnections;
+    }
+
+    private static class NodeInfo {
+        String host;
+        int port;
+        AtomicInteger activeConnections;
+        boolean isActive;
+
+        public NodeInfo(String host, int port, AtomicInteger activeConnections, boolean isActive) {
+            this.host = host;
+            this.port = port;
+            this.activeConnections = activeConnections;
+            this.isActive = isActive;
+        }
+    }
 }
+
+

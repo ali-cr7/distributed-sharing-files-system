@@ -5,21 +5,29 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 class FileNodeServer {
     private final int port;
     private final File baseDir;
+    private volatile boolean isOnline = true;
+    private final AtomicInteger activeConnections = new AtomicInteger(0);
+    private final AtomicInteger artificialLoad = new AtomicInteger(0);
+
+    // Define NodeInfo as a nested record
+    public record NodeInfo(Thread thread, FileNodeServer server, Set<Thread> loadThreads) {}
 
     public FileNodeServer(int port, String baseDirPath) {
         this.port = port;
         this.baseDir = new File(baseDirPath);
-        if (!baseDir.exists()) baseDir.mkdirs();
+        if (!baseDir.exists()) {
+            baseDir.mkdirs();
+        }
 
-        // Create the three default department directories
         for (String dept : List.of("QA", "Graphic", "Development")) {
             File deptDir = new File(baseDir, dept);
             if (!deptDir.exists()) {
@@ -32,23 +40,31 @@ class FileNodeServer {
     }
 
     public void start() throws IOException {
-        // Use fixed thread pool instead of unlimited threads
-        ExecutorService threadPool = Executors.newFixedThreadPool(10); // Adjust size as needed
+        ExecutorService threadPool = Executors.newFixedThreadPool(10);
 
         try (ServerSocket serverSocket = new ServerSocket(port)) {
-            serverSocket.setSoTimeout(5000); // Set accept timeout
+            serverSocket.setSoTimeout(5000);
             System.out.println("File Node running on port " + port);
 
             while (!Thread.currentThread().isInterrupted()) {
+                if (!isOnline) {
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    continue;
+                }
+
                 try {
                     Socket socket = serverSocket.accept();
-                    // Configure socket before handling
-                    socket.setSoTimeout(5000); // 5 second timeout
-                    socket.setTcpNoDelay(true); // Disable Nagle's algorithm
+                    activeConnections.incrementAndGet();
 
+                    socket.setSoTimeout(5000);
+                    socket.setTcpNoDelay(true);
                     threadPool.execute(() -> handleClient(socket));
                 } catch (SocketTimeoutException e) {
-                    // Normal timeout during accept, continue waiting
+                    // Timeout is expected, continue looping
                 } catch (IOException e) {
                     System.err.println("Accept failed: " + e.getMessage());
                 }
@@ -59,57 +75,61 @@ class FileNodeServer {
     }
 
     private void handleClient(Socket socket) {
+        activeConnections.incrementAndGet();
         try {
             socket.setSoTimeout(5000);
-
-            // Initialize output stream FIRST
             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
             out.flush();
-
-            // Then input stream
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
-            // Read the action first
-            String action = in.readUTF();
+            while (!socket.isClosed()) {
+                String action = in.readUTF();
 
-            // Special handling for "list" command
+                if ("ping".equals(action)) {
+                    // Just acknowledge keep-alive
+                    out.writeUTF("pong");
+                    out.flush();
+                    continue;
+                }
+
             if ("list".equals(action)) {
                 String department = in.readUTF();
                 handleListAction(out, department);
                 return;
             }
 
-            // Normal handling for other commands
             String department = in.readUTF();
             String filename = in.readUTF();
-
             System.out.println("[NODE] Received command: " + action + " for " + department + "/" + filename);
 
+            // Simulate processing delay based on artificial load
+            int currentArtificialLoad = artificialLoad.get();
+            if (currentArtificialLoad > 0) {
+                try {
+                    Thread.sleep(currentArtificialLoad * 10L); // Add 10ms delay per artificial load unit
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
             switch (action) {
-                case "add":
-                case "edit":
-                    handleAddEditAction(in, out, department, filename);
-                    break;
-                case "delete":
-                    handleDeleteAction(out, department, filename);
-                    break;
-                case "fetch":
-                    handleFetchAction(out, department, filename);
-                    break;
-                default:
+                case "add", "edit" -> handleAddEditAction(in, out, department, filename);
+                case "delete" -> handleDeleteAction(out, department, filename);
+                case "fetch" -> handleFetchAction(out, department, filename);
+                default -> {
                     System.out.println("[NODE] Invalid action: " + action);
                     out.writeBoolean(false);
-            }
-        } catch (Exception e) {
-            System.out.println("[NODE] Error: " + e.getMessage());
-        } finally {
-            try {
-                socket.close();
-            } catch (IOException e) {
-                System.out.println("[NODE] Error closing socket: " + e.getMessage());
-            }
-        }
+                }
+            }}
+
+    } catch (Exception e) {
+        System.out.println("[NODE] Client handling error: " + e.getMessage());
+    } finally {
+        activeConnections.decrementAndGet();
+        try { socket.close(); } catch (IOException e) {}
     }
+}
+
     private void handleListAction(ObjectOutputStream out, String department) throws IOException {
         File deptDir = new File(baseDir, department);
         List<String> files = new ArrayList<>();
@@ -128,6 +148,7 @@ class FileNodeServer {
         out.writeObject(files);
         out.flush();
     }
+
     private void handleAddEditAction(ObjectInputStream in, ObjectOutputStream out,
                                      String department, String filename) throws Exception {
         byte[] content = (byte[]) in.readObject();
@@ -149,23 +170,17 @@ class FileNodeServer {
         }
     }
 
-    private void handleDeleteAction(ObjectOutputStream out,
-                                    String department, String filename) throws IOException {
+    private void handleDeleteAction(ObjectOutputStream out, String department, String filename) throws IOException {
         File file = new File(new File(baseDir, department), filename);
         boolean deleted = file.exists() && file.delete();
         out.writeBoolean(deleted);
         System.out.println("[NODE] Delete " + filename + " result: " + deleted);
     }
 
-    private void handleFetchAction(ObjectOutputStream out,
-                                   String department, String filename) throws IOException {
+    private void handleFetchAction(ObjectOutputStream out, String department, String filename) throws IOException {
         System.out.println("[NODE] Fetch request for: " + department + "/" + filename);
         File deptDir = new File(baseDir, department);
         File targetFile = new File(deptDir, filename);
-
-        // Debug output
-        System.out.println("[NODE] Looking in: " + targetFile.getAbsolutePath());
-        System.out.println("[NODE] File exists: " + targetFile.exists());
 
         if (targetFile.exists() && targetFile.isFile()) {
             try {
@@ -186,95 +201,142 @@ class FileNodeServer {
         }
     }
 
-    public static void main(String[] args) {
-        var nodeThreads = new java.util.HashMap<Integer, Thread>();
-        var activePorts = List.of(5001, 5002, 5003);
+    public int getCurrentLoad() {
+        return activeConnections.get() + artificialLoad.get();
+    }
 
-        // Start all three nodes at the beginning
-        for (int i = 0; i < activePorts.size(); i++) {
-            int port = activePorts.get(i);
-            int nodeNum = i + 1;
-            Thread t = new Thread(() -> startNode(port, "node" + nodeNum));
+    public void addArtificialLoad(int amount) {
+        artificialLoad.addAndGet(amount);
+    }
+
+    public void removeArtificialLoad(int amount) {
+        artificialLoad.updateAndGet(current -> Math.max(0, current - amount));
+    }
+
+    public void clearArtificialLoad() {
+        artificialLoad.set(0);
+    }
+
+    public int getArtificialLoad() {
+        return artificialLoad.get();
+    }
+
+    public static void main(String[] args) {
+        Map<Integer, NodeInfo> nodeMap = new ConcurrentHashMap<>();
+        List<Integer> ports = List.of(5001, 5002, 5003);
+
+        // Initialize nodes
+        for (int i = 0; i < ports.size(); i++) {
+            int port = ports.get(i);
+            String name = "node" + (i + 1);
+            FileNodeServer server = new FileNodeServer(port, name);
+            Thread t = new Thread(() -> {
+                try {
+                    server.start();
+                } catch (IOException e) {
+                    System.out.println("[NODE] Start failed: " + e.getMessage());
+                }
+            }, "Node-" + port);
             t.start();
-            nodeThreads.put(port, t);
-            System.out.println("Node " + nodeNum + " started on port " + port);
+            nodeMap.put(port, new NodeInfo(t, server, ConcurrentHashMap.newKeySet()));
+            System.out.println("Node " + name + " started on port " + port);
         }
 
-        java.util.Scanner scanner = new java.util.Scanner(System.in);
+        Scanner scanner = new Scanner(System.in);
 
         while (true) {
             System.out.println("\n=== File Node Controller ===");
             System.out.println("1) Start node");
             System.out.println("2) Stop node");
             System.out.println("3) List active nodes");
+
             System.out.println("0) Exit");
             System.out.print("Choose: ");
-            String choice = scanner.nextLine();
 
-            switch (choice) {
-                case "1" -> {
-                    System.out.print("Enter node number (1-3): ");
-                    int num = Integer.parseInt(scanner.nextLine());
-                    if (num < 1 || num > 3) {
-                        System.out.println("Invalid node number.");
-                        continue;
+            try {
+                String choice = scanner.nextLine();
+
+                switch (choice) {
+                    case "1" -> startNode(scanner, nodeMap, ports);
+                    case "2" -> stopNode(scanner, nodeMap, ports);
+                    case "3" -> listNodes(nodeMap);
+
+                    case "0" -> {
+                        shutdownAll(nodeMap);
+                        return;
                     }
-                    int port = activePorts.get(num - 1);
-                    if (nodeThreads.containsKey(port)) {
-                        System.out.println("Node " + num + " is already running.");
-                        continue;
-                    }
-                    Thread t = new Thread(() -> startNode(port, "node" + num));
-                    t.start();
-                    nodeThreads.put(port, t);
-                    System.out.println("Node " + num + " started.");
+                    default -> System.out.println("Invalid choice.");
                 }
-
-                case "2" -> {
-                    System.out.print("Enter node number (1-3): ");
-                    int num = Integer.parseInt(scanner.nextLine());
-                    int port = activePorts.get(num - 1);
-                    Thread t = nodeThreads.get(port);
-                    if (t != null) {
-                        t.interrupt();
-                        nodeThreads.remove(port);
-                        System.out.println("Node " + num + " stopped.");
-                    } else {
-                        System.out.println("Node " + num + " is not running.");
-                    }
-                }
-
-                case "3" -> {
-                    System.out.println("Active Nodes:");
-                    for (var entry : nodeThreads.entrySet()) {
-                        System.out.println(" - Node on port " + entry.getKey() + " is running.");
-                    }
-                    if (nodeThreads.isEmpty()) {
-                        System.out.println("No active nodes.");
-                    }
-                }
-
-                case "0" -> {
-                    System.out.println("Shutting down all nodes...");
-                    for (Thread t : nodeThreads.values()) {
-                        t.interrupt();
-                    }
-                    return;
-                }
-
-                default -> System.out.println("Invalid choice.");
+            } catch (Exception e) {
+                System.out.println("Error: " + e.getMessage());
             }
         }
     }
 
-
-
-    private static void startNode(int port, String name) {
-        try {
-            System.out.println("Starting " + name + " on port " + port);
-            new FileNodeServer(port, name).start();
-        } catch (IOException e) {
-            System.err.println(name + " failed: " + e.getMessage());
+    private static void startNode(Scanner scanner, Map<Integer, FileNodeServer.NodeInfo> nodeMap, List<Integer> ports) {
+        System.out.print("Enter node number (1-3): ");
+        int num = Integer.parseInt(scanner.nextLine());
+        if (num < 1 || num > 3) {
+            System.out.println("Invalid node number.");
+            return;
         }
+        int port = ports.get(num - 1);
+        if (nodeMap.containsKey(port)) {
+            System.out.println("Node " + num + " is already running.");
+            return;
+        }
+        String name = "node" + num;
+        FileNodeServer server = new FileNodeServer(port, name);
+        Thread t = new Thread(() -> {
+            try {
+                server.start();
+            } catch (IOException e) {
+                System.out.println("[NODE] Start failed: " + e.getMessage());
+            }
+        }, "Node-" + port);
+        t.start();
+        nodeMap.put(port, new NodeInfo(t, server, ConcurrentHashMap.newKeySet()));
+        System.out.println("Node " + num + " started.");
+    }
+
+    private static void stopNode(Scanner scanner, Map<Integer, FileNodeServer.NodeInfo> nodeMap, List<Integer> ports) {
+        System.out.print("Enter node number (1-3): ");
+        int num = Integer.parseInt(scanner.nextLine());
+        int port = ports.get(num - 1);
+        FileNodeServer.NodeInfo info = nodeMap.get(port);
+        if (info != null) {
+            info.loadThreads().forEach(Thread::interrupt);
+            info.loadThreads().clear();
+            info.thread().interrupt();
+            nodeMap.remove(port);
+            System.out.println("Node " + num + " stopped.");
+        } else {
+            System.out.println("Node " + num + " is not running.");
+        }
+    }
+
+    private static void listNodes(Map<Integer, FileNodeServer.NodeInfo> nodeMap) {
+        if (nodeMap.isEmpty()) {
+            System.out.println("No active nodes.");
+        } else {
+            System.out.println("Active Nodes:");
+            nodeMap.forEach((port, info) -> {
+                int realLoad = info.server().activeConnections.get()/2;
+
+                int totalLoad = info.server().getCurrentLoad();
+                System.out.printf(" - Node on port %d: %s%n", port,
+                        info.thread().isAlive() ? "RUNNING" : "STOPPED");
+                System.out.printf("   Load: %d (Real: %d)%n",
+                        totalLoad, realLoad);
+            });
+        }
+    }
+
+    private static void shutdownAll(Map<Integer, FileNodeServer.NodeInfo> nodeMap) {
+        System.out.println("Shutting down all nodes...");
+        nodeMap.values().forEach(info -> {
+            info.loadThreads().forEach(Thread::interrupt);
+            info.thread().interrupt();
+        });
     }
 }

@@ -1,19 +1,139 @@
 package client;
 
 import server.CoordinatorService;
-
-import java.io.IOException;
+import java.io.*;
+import java.net.Socket;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
-import java.util.List;
-import java.util.Scanner;
+import java.util.*;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class TestClient {
     private static final List<String> ALLOWED_DEPARTMENTS = List.of("QA", "Graphic", "Development", "general");
     private static String currentUsername = "";
     private static String currentRole = "";
+
+    // Track active load connections
+    private static final List<LoadConnection> activeConnections = new ArrayList<>();
+    private static final AtomicBoolean stopRequested = new AtomicBoolean(false);
+
+    private static class LoadConnection {
+        final Thread thread;
+        final Socket socket;
+
+        public LoadConnection(Thread thread, Socket socket) {
+            this.thread = thread;
+            this.socket = socket;
+        }
+    }
+
+    private static void createRealLoad(Scanner scanner, CoordinatorService service) {
+        try {
+            System.out.print("Enter node port (5001/5002/5003): ");
+            int port = Integer.parseInt(scanner.nextLine());
+
+            System.out.print("Number of parallel connections to create: ");
+            int connections = Integer.parseInt(scanner.nextLine());
+
+            System.out.print("Duration (seconds, 0 for indefinite): ");
+            int duration = Integer.parseInt(scanner.nextLine());
+
+            System.out.println("Creating " + connections + " real connections to port " + port + "...");
+
+            stopRequested.set(false);
+            clearActiveConnections();
+
+            for (int i = 0; i < connections; i++) {
+                final int threadNum = i;
+                Thread t = new Thread(() -> {
+                    try (Socket socket = new Socket("localhost", port);
+                         ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                         ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+
+                        synchronized (activeConnections) {
+                            activeConnections.add(new LoadConnection(Thread.currentThread(), socket));
+                        }
+
+                        System.out.println("Connection " + threadNum + " established");
+
+                        // Initial handshake
+                        out.writeUTF("ping");
+                        out.flush();
+
+                        long endTime = duration > 0 ?
+                                System.currentTimeMillis() + (duration * 1000) :
+                                Long.MAX_VALUE;
+
+                        while (!stopRequested.get() && System.currentTimeMillis() < endTime) {
+                            try {
+                                // Send keep-alive
+                                out.writeUTF("ping");
+                                out.flush();
+
+                                // Wait for response
+                                String response = in.readUTF();
+                                if (!"pong".equals(response)) {
+                                    break;
+                                }
+
+                                Thread.sleep(1000);
+                            } catch (InterruptedException e) {
+                                break;
+                            }
+                        }
+
+                        System.out.println("Connection " + threadNum + " closing normally");
+                    } catch (Exception e) {
+                        System.out.println("Connection " + threadNum + " error: " + e.getMessage());
+                    } finally {
+                        removeConnection(Thread.currentThread());
+                    }
+                });
+
+                t.start();
+            }
+
+            System.out.println("Load generation started. Use option 6 to stop early.");
+        } catch (Exception e) {
+            System.out.println("Error creating load: " + e.getMessage());
+        }
+    }
+
+    private static void clearActiveConnections() {
+        synchronized (activeConnections) {
+            for (LoadConnection conn : activeConnections) {
+                try {
+                    if (!conn.socket.isClosed()) {
+                        conn.socket.close();
+                    }
+                } catch (IOException e) {
+                    System.out.println("Error closing socket: " + e.getMessage());
+                }
+                conn.thread.interrupt();
+            }
+            activeConnections.clear();
+        }
+    }
+
+    private static void removeConnection(Thread thread) {
+        synchronized (activeConnections) {
+            activeConnections.removeIf(conn -> conn.thread == thread);
+        }
+    }
+
+    private static void stopAllLoad() {
+        stopRequested.set(true);
+        clearActiveConnections();
+        System.out.println("All load connections stopped");
+    }
+
+    private static void showActiveLoadStats() {
+        synchronized (activeConnections) {
+            System.out.println("Currently active load connections: " + activeConnections.size());
+        }
+    }
 
     public static void main(String[] args) {
         try (Scanner scanner = new Scanner(System.in)) {
@@ -50,8 +170,8 @@ public class TestClient {
                 if (currentRole.equals("manager")) {
                     System.out.println("3) User Management");
                     System.out.println("4) List All Users");
-                    System.out.println("5) Simulate Load on Node");
-                    System.out.println("6) Toggle Node On/Off");
+                    System.out.println("5) Create Real Load (Socket Connections)");
+
                 }
 
                 System.out.println("0) Logout");
@@ -86,13 +206,7 @@ public class TestClient {
                             break;
                         case 5:
                             if (currentRole.equals("manager")) {
-                                simulateLoadOnNode(scanner, service);
-                            }
-                            break;
-
-                        case 6:
-                            if (currentRole.equals("manager")) {
-                                toggleNodeStatus(scanner, service);
+                                createRealLoad(scanner, service);
                             }
                             break;
 
@@ -278,35 +392,7 @@ public class TestClient {
             users.forEach(System.out::println);
         }
     }
-    private static void simulateLoadOnNode(Scanner scanner, CoordinatorService service) {
-        try {
-            System.out.print("Enter node index (0-based): ");
-            int nodeIndex = Integer.parseInt(scanner.nextLine());
 
-            System.out.print("Enter load amount to simulate: ");
-            int loadAmount = Integer.parseInt(scanner.nextLine());
 
-            service.simulateLoadOnNode(nodeIndex, loadAmount);
-            System.out.println("Simulated " + loadAmount + " load on node " + nodeIndex);
-        } catch (Exception e) {
-            System.out.println("Failed to simulate load: " + e.getMessage());
-        }
-    }
-    private static void toggleNodeStatus(Scanner scanner, CoordinatorService service) {
-        try {
-            System.out.print("Enter node index (0-based): ");
-            int nodeIndex = Integer.parseInt(scanner.nextLine());
-
-            System.out.print("Enter status (on/off): ");
-            String status = scanner.nextLine().trim().toLowerCase();
-
-            boolean activate = status.equals("on");
-            service.setNodeStatus(nodeIndex, activate);
-
-            System.out.println("Node " + nodeIndex + " is now " + (activate ? "ON" : "OFF"));
-        } catch (Exception e) {
-            System.out.println("Failed to change node status: " + e.getMessage());
-        }
-    }
 
 }
