@@ -353,13 +353,82 @@ public class TestClient {
             department = scanner.nextLine();
         } while (!ALLOWED_DEPARTMENTS.contains(department));
 
+        if (action.equals("list")) {
+            List<String> files = service.listFiles(token, department);
+            if (files.isEmpty()) {
+                System.out.println("No files found in " + department + " department.");
+                return;
+            }
+            System.out.println("\nAvailable files in " + department + ":");
+            for (int i = 0; i < files.size(); i++) {
+                System.out.println((i+1) + ") " + files.get(i));
+            }
+            return;
+        }
+
+        if (action.equals("edit")) {
+            // List available files
+            List<String> files = service.listFiles(token, department);
+            if (files.isEmpty()) {
+                System.out.println("No files found in " + department + " department.");
+                return;
+            }
+
+            System.out.println("\nAvailable files in " + department + ":");
+            for (int i = 0; i < files.size(); i++) {
+                System.out.println((i+1) + ") " + files.get(i));
+            }
+
+            // Get file selection
+            int selection;
+            do {
+                System.out.print("\nSelect file to edit (1-" + files.size() + "): ");
+                try {
+                    selection = Integer.parseInt(scanner.nextLine());
+                } catch (NumberFormatException e) {
+                    selection = -1;
+                }
+            } while (selection < 1 || selection > files.size());
+
+            String filename = files.get(selection-1);
+            
+            // Show current content
+            System.out.println("\nCurrent file content:");
+            byte[] currentContent = service.requestFile(token, filename, department);
+            if (currentContent != null && currentContent.length > 0) {
+                System.out.println(new String(currentContent));
+            } else {
+                System.out.println("(Empty file)");
+            }
+
+            // Get new content
+            System.out.println("\nEnter new content (type 'END' on a new line to finish):");
+            StringBuilder newContent = new StringBuilder();
+            String line;
+            while (!(line = scanner.nextLine()).equals("END")) {
+                newContent.append(line).append("\n");
+            }
+
+            // Send edit command
+            boolean result = service.sendFileCommand(token, "edit", filename, department, 
+                newContent.toString().getBytes());
+            System.out.println(result ? "File edited successfully!" : "Edit operation failed!");
+            return;
+        }
+
+        // For add and delete operations
         System.out.print("Filename: ");
         String filename = scanner.nextLine();
 
         byte[] content = new byte[0];
-        if (!action.equals("delete")) {
-            System.out.print("File content: ");
-            content = scanner.nextLine().getBytes();
+        if (action.equals("add")) {
+            System.out.println("Enter file content (type 'END' on a new line to finish):");
+            StringBuilder fileContent = new StringBuilder();
+            String line;
+            while (!(line = scanner.nextLine()).equals("END")) {
+                fileContent.append(line).append("\n");
+            }
+            content = fileContent.toString().getBytes();
         }
 
         boolean result = service.sendFileCommand(token, action, filename, department, content);

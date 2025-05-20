@@ -17,6 +17,7 @@ class FileNodeServer {
     private volatile boolean isOnline = true;
     private final AtomicInteger activeConnections = new AtomicInteger(0);
     private final AtomicInteger artificialLoad = new AtomicInteger(0);
+    private final Set<Socket> loadTestSockets = Collections.synchronizedSet(new HashSet<>());
 
     // Define NodeInfo as a nested record
     public record NodeInfo(Thread thread, FileNodeServer server, Set<Thread> loadThreads) {}
@@ -39,41 +40,6 @@ class FileNodeServer {
         }
     }
 
-    public void start() throws IOException {
-        ExecutorService threadPool = Executors.newFixedThreadPool(10);
-
-        try (ServerSocket serverSocket = new ServerSocket(port)) {
-            serverSocket.setSoTimeout(5000);
-            System.out.println("File Node running on port " + port);
-
-            while (!Thread.currentThread().isInterrupted()) {
-                if (!isOnline) {
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                    continue;
-                }
-
-                try {
-                    Socket socket = serverSocket.accept();
-                    activeConnections.incrementAndGet();
-
-                    socket.setSoTimeout(5000);
-                    socket.setTcpNoDelay(true);
-                    threadPool.execute(() -> handleClient(socket));
-                } catch (SocketTimeoutException e) {
-                    // Timeout is expected, continue looping
-                } catch (IOException e) {
-                    System.err.println("Accept failed: " + e.getMessage());
-                }
-            }
-        } finally {
-            threadPool.shutdown();
-        }
-    }
-
     private void handleClient(Socket socket) {
         activeConnections.incrementAndGet();
         try {
@@ -83,90 +49,155 @@ class FileNodeServer {
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
             while (!socket.isClosed()) {
-                String action = in.readUTF();
-
-                if ("ping".equals(action)) {
-                    // Just acknowledge keep-alive
-                    out.writeUTF("pong");
-                    out.flush();
-                    continue;
-                }
-
-            if ("list".equals(action)) {
-                String department = in.readUTF();
-                handleListAction(out, department);
-                return;
-            }
-
-            String department = in.readUTF();
-            String filename = in.readUTF();
-            System.out.println("[NODE] Received command: " + action + " for " + department + "/" + filename);
-
-            // Simulate processing delay based on artificial load
-            int currentArtificialLoad = artificialLoad.get();
-            if (currentArtificialLoad > 0) {
                 try {
-                    Thread.sleep(currentArtificialLoad * 10L); // Add 10ms delay per artificial load unit
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
+                    String action = in.readUTF();
+
+                    if ("ping".equals(action)) {
+                        // Add socket to load test set if it's a ping connection
+                        loadTestSockets.add(socket);
+                        // Apply artificial load only to ping operations
+                        int currentArtificialLoad = artificialLoad.get();
+                        if (currentArtificialLoad > 0) {
+                            try {
+                                Thread.sleep(currentArtificialLoad * 10L);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                        }
+                        out.writeUTF("pong");
+                        out.flush();
+                        continue;
+                    }
+
+                    if ("getLoad".equals(action)) {
+                        // Return only the number of load test connections
+                        int loadTestCount = loadTestSockets.size();
+                        out.writeInt(loadTestCount);
+                        out.flush();
+                        return;
+                    }
+
+                    String department = in.readUTF();
+                    String filename = in.readUTF();
+                    System.out.println("[NODE] Received command: " + action + " for " + department + "/" + filename);
+
+                    switch (action) {
+                        case "list" -> handleListAction(out, department);
+                        case "add", "edit" -> handleAddEditAction(in, out, department, filename);
+                        case "delete" -> handleDeleteAction(out, department, filename);
+                        case "fetch" -> handleFetchAction(out, department, filename);
+                        default -> {
+                            System.out.println("[NODE] Invalid action: " + action);
+                            out.writeBoolean(false);
+                        }
+                    }
+                } catch (EOFException e) {
+                    System.out.println("[NODE] Client disconnected normally");
+                    break;
+                } catch (SocketTimeoutException e) {
+                    continue;
+                } catch (IOException e) {
+                    if (!socket.isClosed()) {
+                        System.out.println("[NODE] Client connection error: " + e.getMessage());
+                    }
+                    break;
+                } catch (Exception e) {
+                    System.out.println("[NODE] Unexpected error: " + e.getMessage());
+                    break;
                 }
             }
-
-            switch (action) {
-                case "add", "edit" -> handleAddEditAction(in, out, department, filename);
-                case "delete" -> handleDeleteAction(out, department, filename);
-                case "fetch" -> handleFetchAction(out, department, filename);
-                default -> {
-                    System.out.println("[NODE] Invalid action: " + action);
-                    out.writeBoolean(false);
+        } catch (IOException e) {
+            if (!socket.isClosed()) {
+                System.out.println("[NODE] Initial connection error: " + e.getMessage());
+            }
+        } finally {
+            loadTestSockets.remove(socket);
+            activeConnections.decrementAndGet();
+            try {
+                if (!socket.isClosed()) {
+                    socket.close();
                 }
-            }}
-
-    } catch (Exception e) {
-        System.out.println("[NODE] Client handling error: " + e.getMessage());
-    } finally {
-        activeConnections.decrementAndGet();
-        try { socket.close(); } catch (IOException e) {}
-    }
-}
-
-    private void handleListAction(ObjectOutputStream out, String department) throws IOException {
-        File deptDir = new File(baseDir, department);
-        List<String> files = new ArrayList<>();
-
-        if (deptDir.exists()) {
-            File[] listFiles = deptDir.listFiles();
-            if (listFiles != null) {
-                for (File f : listFiles) {
-                    if (f.isFile()) {
-                        files.add(f.getName());
-                    }
-                }
+            } catch (IOException e) {
+                // Ignore close errors
             }
         }
+    }
 
-        out.writeObject(files);
-        out.flush();
+    private void handleListAction(ObjectOutputStream out, String department) throws IOException {
+        try {
+            File deptDir = new File(baseDir, department);
+            List<String> files = new ArrayList<>();
+
+            System.out.println("[NODE] Listing files in directory: " + deptDir.getAbsolutePath());
+            
+            if (deptDir.exists()) {
+                File[] listFiles = deptDir.listFiles();
+                if (listFiles != null) {
+                    for (File f : listFiles) {
+                        if (f.isFile()) {
+                            files.add(f.getName());
+                            System.out.println("[NODE] Found file: " + f.getName());
+                        }
+                    }
+                } else {
+                    System.out.println("[NODE] Directory is empty or cannot be read: " + deptDir.getAbsolutePath());
+                }
+            } else {
+                System.out.println("[NODE] Department directory does not exist: " + deptDir.getAbsolutePath());
+                deptDir.mkdirs();
+            }
+
+            System.out.println("[NODE] Sending " + files.size() + " files to client");
+            out.writeObject(files);
+            out.flush();
+        } catch (Exception e) {
+            System.err.println("[NODE] Error in handleListAction: " + e.getMessage());
+            e.printStackTrace();
+            out.writeObject(new ArrayList<String>());
+            out.flush();
+        }
     }
 
     private void handleAddEditAction(ObjectInputStream in, ObjectOutputStream out,
                                      String department, String filename) throws Exception {
-        byte[] content = (byte[]) in.readObject();
-        File deptDir = new File(baseDir, department);
-        if (!deptDir.exists()) {
-            deptDir.mkdirs();
-        }
+        try {
+            System.out.println("[NODE] Starting " + (new File(new File(baseDir, department), filename).exists() ? "edit" : "add") + 
+                             " operation for " + department + "/" + filename);
+            
+            byte[] content = (byte[]) in.readObject();
+            if (content == null) {
+                System.out.println("[NODE] Received null content for file operation");
+                out.writeBoolean(false);
+                out.flush();
+                return;
+            }
 
-        File file = new File(deptDir, filename);
-        try (FileOutputStream fos = new FileOutputStream(file)) {
-            fos.write(content);
-            out.writeBoolean(true);
-            out.flush();
-            System.out.println("[NODE] File " + filename + " saved successfully");
-        } catch (IOException e) {
-            out.writeBoolean(false);
-            out.flush();
-            System.out.println("[NODE] Error saving file: " + e.getMessage());
+            File deptDir = new File(baseDir, department);
+            if (!deptDir.exists()) {
+                boolean created = deptDir.mkdirs();
+                System.out.println("[NODE] " + (created ? "Created" : "Failed to create") + " directory: " + deptDir.getAbsolutePath());
+            }
+
+            File file = new File(deptDir, filename);
+            try (FileOutputStream fos = new FileOutputStream(file)) {
+                fos.write(content);
+                out.writeBoolean(true);
+                out.flush();
+                System.out.println("[NODE] File " + filename + " saved successfully");
+            } catch (IOException e) {
+                System.err.println("[NODE] Error writing file " + filename + ": " + e.getMessage());
+                out.writeBoolean(false);
+                out.flush();
+            }
+        } catch (Exception e) {
+            System.err.println("[NODE] Error in handleAddEditAction: " + e.getMessage());
+            e.printStackTrace();
+            try {
+                out.writeBoolean(false);
+                out.flush();
+            } catch (IOException ex) {
+                System.err.println("[NODE] Error sending failure response: " + ex.getMessage());
+            }
         }
     }
 
@@ -190,10 +221,8 @@ class FileNodeServer {
                 out.writeBoolean(true);
                 out.flush();
             } catch (IOException e) {
-                System.out.println("[NODE] Read error: " + e.getMessage());
+                System.err.println("[NODE] Error reading file: " + e.getMessage());
                 out.writeObject(new byte[0]);
-                out.writeBoolean(false);
-                out.flush();
             }
         } else {
             System.out.println("[NODE] File not found");
@@ -202,7 +231,7 @@ class FileNodeServer {
     }
 
     public int getCurrentLoad() {
-        return activeConnections.get() + artificialLoad.get();
+        return loadTestSockets.size();
     }
 
     public void addArtificialLoad(int amount) {
@@ -219,6 +248,39 @@ class FileNodeServer {
 
     public int getArtificialLoad() {
         return artificialLoad.get();
+    }
+
+    public void start() throws IOException {
+        ExecutorService threadPool = Executors.newFixedThreadPool(10);
+
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            serverSocket.setSoTimeout(5000);
+            System.out.println("File Node running on port " + port);
+
+            while (!Thread.currentThread().isInterrupted()) {
+                if (!isOnline) {
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    continue;
+                }
+
+                try {
+                    Socket socket = serverSocket.accept();
+                    socket.setSoTimeout(5000);
+                    socket.setTcpNoDelay(true);
+                    threadPool.execute(() -> handleClient(socket));
+                } catch (SocketTimeoutException e) {
+                    // Timeout is expected, continue looping
+                } catch (IOException e) {
+                    System.err.println("Accept failed: " + e.getMessage());
+                }
+            }
+        } finally {
+            threadPool.shutdown();
+        }
     }
 
     public static void main(String[] args) {
@@ -321,13 +383,12 @@ class FileNodeServer {
         } else {
             System.out.println("Active Nodes:");
             nodeMap.forEach((port, info) -> {
-                int realLoad = info.server().activeConnections.get()/2;
-
-                int totalLoad = info.server().getCurrentLoad();
+                int loadTestCount = info.server().loadTestSockets.size();
+                int activeConnCount = info.server().activeConnections.get();
                 System.out.printf(" - Node on port %d: %s%n", port,
                         info.thread().isAlive() ? "RUNNING" : "STOPPED");
                 System.out.printf("   Load: %d (Real: %d)%n",
-                        totalLoad, realLoad);
+                        loadTestCount, activeConnCount);
             });
         }
     }
