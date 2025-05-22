@@ -9,6 +9,7 @@ import java.util.*;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.net.InetSocketAddress;
 
 public class TestClient {
     private static final List<String> ALLOWED_DEPARTMENTS = List.of("QA", "Graphic", "Development", "general");
@@ -40,7 +41,7 @@ public class TestClient {
             System.out.print("Duration (seconds, 0 for indefinite): ");
             int duration = Integer.parseInt(scanner.nextLine());
 
-            System.out.println("Creating " + connections + " real connections to port " + port + "...");
+            System.out.println("Creating " + connections + " persistent connections to port " + port + "...");
 
             stopRequested.set(false);
             clearActiveConnections();
@@ -48,50 +49,29 @@ public class TestClient {
             for (int i = 0; i < connections; i++) {
                 final int threadNum = i;
                 Thread t = new Thread(() -> {
-                    try (Socket socket = new Socket("localhost", port);
-                         ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-                         ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
-
-                        synchronized (activeConnections) {
-                            activeConnections.add(new LoadConnection(Thread.currentThread(), socket));
-                        }
-
-                        System.out.println("Connection " + threadNum + " established");
-
-                        // Initial handshake
-                        out.writeUTF("ping");
-                        out.flush();
-
-                        long endTime = duration > 0 ?
-                                System.currentTimeMillis() + (duration * 1000) :
-                                Long.MAX_VALUE;
-
-                        while (!stopRequested.get() && System.currentTimeMillis() < endTime) {
-                            try {
-                                // Send keep-alive
+                    long endTime = duration > 0 ? System.currentTimeMillis() + (duration * 1000) : Long.MAX_VALUE;
+                    while (!stopRequested.get() && System.currentTimeMillis() < endTime) {
+                        try (Socket socket = new Socket("localhost", port)) {
+                            ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                            ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+                            synchronized (activeConnections) {
+                                activeConnections.add(new LoadConnection(Thread.currentThread(), socket));
+                            }
+                            while (!stopRequested.get() && System.currentTimeMillis() < endTime) {
                                 out.writeUTF("ping");
                                 out.flush();
-
-                                // Wait for response
-                                String response = in.readUTF();
-                                if (!"pong".equals(response)) {
-                                    break;
-                                }
-
-                                Thread.sleep(1000);
-                            } catch (InterruptedException e) {
-                                break;
+                                String resp = in.readUTF();
+                                if (!"pong".equals(resp)) break;
+                                Thread.sleep(2000); // 2 seconds between pings
                             }
+                        } catch (Exception e) {
+                            // Optionally print/log error
+                            try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+                        } finally {
+                            removeConnection(Thread.currentThread());
                         }
-
-                        System.out.println("Connection " + threadNum + " closing normally");
-                    } catch (Exception e) {
-                        System.out.println("Connection " + threadNum + " error: " + e.getMessage());
-                    } finally {
-                        removeConnection(Thread.currentThread());
                     }
-                });
-
+                }, "LoadThread-" + threadNum);
                 t.start();
             }
 
@@ -393,20 +373,31 @@ public class TestClient {
             String filename = files.get(selection-1);
             
             // Show current content
-            System.out.println("\nCurrent file content:");
+            System.out.println("\n=== Current File Content ===");
             byte[] currentContent = service.requestFile(token, filename, department);
             if (currentContent != null && currentContent.length > 0) {
                 System.out.println(new String(currentContent));
             } else {
                 System.out.println("(Empty file)");
             }
+            System.out.println("=== End of Current Content ===\n");
 
             // Get new content
-            System.out.println("\nEnter new content (type 'END' on a new line to finish):");
+            System.out.println("Enter new content (type 'END' on a new line to finish):");
+            System.out.println("----------------------------------------");
             StringBuilder newContent = new StringBuilder();
             String line;
             while (!(line = scanner.nextLine()).equals("END")) {
                 newContent.append(line).append("\n");
+            }
+            System.out.println("----------------------------------------");
+
+            // Confirm edit
+            System.out.print("\nDo you want to save these changes? (yes/no): ");
+            String confirm = scanner.nextLine().toLowerCase();
+            if (!confirm.equals("yes")) {
+                System.out.println("Edit cancelled.");
+                return;
             }
 
             // Send edit command
@@ -423,11 +414,13 @@ public class TestClient {
         byte[] content = new byte[0];
         if (action.equals("add")) {
             System.out.println("Enter file content (type 'END' on a new line to finish):");
+            System.out.println("----------------------------------------");
             StringBuilder fileContent = new StringBuilder();
             String line;
             while (!(line = scanner.nextLine()).equals("END")) {
                 fileContent.append(line).append("\n");
             }
+            System.out.println("----------------------------------------");
             content = fileContent.toString().getBytes();
         }
 
@@ -461,7 +454,4 @@ public class TestClient {
             users.forEach(System.out::println);
         }
     }
-
-
-
 }
