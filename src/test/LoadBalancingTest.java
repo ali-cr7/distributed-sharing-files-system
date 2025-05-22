@@ -48,6 +48,6 @@ public class LoadBalancingTest {
         }
         for (Thread t : threads) t.join();
 
-        System.out.println("All download requests completed. Check coordinator logs for which node served each request.");
+        System.out.println("All downloads requests completed. Check coordinator logs for which node served each request.");
     }
 }
