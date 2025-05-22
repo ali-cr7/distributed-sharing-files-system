@@ -371,7 +371,7 @@ public class TestClient {
             } while (selection < 1 || selection > files.size());
 
             String filename = files.get(selection-1);
-            
+
             // Show current content
             System.out.println("\n=== Current File Content ===");
             byte[] currentContent = service.requestFile(token, filename, department);
@@ -401,8 +401,8 @@ public class TestClient {
             }
 
             // Send edit command
-            boolean result = service.sendFileCommand(token, "edit", filename, department, 
-                newContent.toString().getBytes());
+            boolean result = service.sendFileCommand(token, "edit", filename, department,
+                    newContent.toString().getBytes());
             System.out.println(result ? "File edited successfully!" : "Edit operation failed!");
             return;
         }

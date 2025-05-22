@@ -58,7 +58,7 @@ class FileNodeServer {
         socketThreads.put(socket, currentThread);
         validConnections.put(socket, false); // Mark as invalid initially
         boolean connectionCounted = false;
-        
+
         try {
             socket.setSoTimeout(SOCKET_TIMEOUT);
             socket.setKeepAlive(true);
@@ -73,7 +73,7 @@ class FileNodeServer {
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
             String action = in.readUTF();
-            System.out.println("[NODE] Received action: " + action);
+          //  System.out.println("[NODE] Received action: " + action);
 
             // Only increment connection count for valid actions
             if (isValidAction(action)) {
@@ -83,7 +83,7 @@ class FileNodeServer {
                 if (!connectionCounted) {
                     int currentLoad = activeConnections.incrementAndGet();
                     connectionCounted = true;
-                    System.out.println("[NODE] New valid connection. Current load: " + currentLoad);
+                  //  System.out.println("[NODE] New valid connection. Current load: " + currentLoad);
                 }
             }
 
@@ -116,7 +116,7 @@ class FileNodeServer {
                         if (!"ping".equals(nextAction)) break;
                     }
                 } catch (IOException e) {
-                    System.out.println("[NODE] Error sending pong response: " + e.getMessage());
+                  //3  System.out.println("[NODE] Error sending pong response: " + e.getMessage());
                 }
                 return;
             }
@@ -167,13 +167,13 @@ class FileNodeServer {
 
     private boolean isValidAction(String action) {
         return action != null && (
-            action.equals("list") ||
-            action.equals("ping") ||
-            action.equals("getLoad") ||
-            action.equals("add") ||
-            action.equals("edit") ||
-            action.equals("delete") ||
-            action.equals("fetch")
+                action.equals("list") ||
+                        action.equals("ping") ||
+                        action.equals("getLoad") ||
+                        action.equals("add") ||
+                        action.equals("edit") ||
+                        action.equals("delete") ||
+                        action.equals("fetch")
         );
     }
 
@@ -338,8 +338,8 @@ class FileNodeServer {
                     socket.setReuseAddress(true);
                     socket.setSoLinger(true, 5);
 
-                    System.out.println("[NODE] New connection accepted. Current load: " + activeConnections.get() +
-                            " (Total connections: " + totalConnections.get() + ")");
+//                    System.out.println("[NODE] New connection accepted. Current load: " + activeConnections.get() +
+//                            " (Total connections: " + totalConnections.get() + ")");
 
                     threadPool.execute(() -> handleClient(socket));
                 } catch (SocketTimeoutException e) {
@@ -366,13 +366,13 @@ class FileNodeServer {
                 activeSockets.remove(socket);
                 if (activeConnections.get() > 0) {
                     int currentLoad = activeConnections.decrementAndGet();
-                    System.out.println("[NODE] Connection cleaned up. Current load: " + currentLoad);
+                  //  System.out.println("[NODE] Connection cleaned up. Current load: " + currentLoad);
                 }
             }
             connectionTimestamps.remove(socket);
             socketThreads.remove(socket);
             validConnections.remove(socket);
-            
+
             if (!socket.isClosed()) {
                 try {
                     socket.shutdownInput();

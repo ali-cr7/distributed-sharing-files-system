@@ -36,6 +36,14 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
     private Timer healthCheckTimer;
     private final int MAX_RETRIES = 3;
     private final int HEALTH_CHECK_INTERVAL = 5000; // 5 seconds
+    private final int CONNECTION_TIMEOUT = 3000; // 3 seconds
+    private final int SOCKET_TIMEOUT = 5000; // 5 seconds
+    private final int MAX_FAILURES = 3;
+    private final int LOAD_UPDATE_INTERVAL = 2000; // 2 seconds
+    private final Map<Integer, Long> lastSuccessfulHealthCheck = new ConcurrentHashMap<>();
+    private final Map<Integer, Long> lastSuccessfulLoadUpdate = new ConcurrentHashMap<>();
+    private final Map<Integer, Integer> consecutiveFailures = new ConcurrentHashMap<>();
+    private final Map<Integer, Boolean> nodeRecoveryInProgress = new ConcurrentHashMap<>();
 
     protected CoordinatorServiceImpl() throws RemoteException {
         super();
@@ -64,9 +72,13 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         loadUpdateTimer.scheduleAtFixedRate(new TimerTask() {
             @Override
             public void run() {
-                updateNodeLoads();
+                try {
+                    updateNodeLoads();
+                } catch (Exception e) {
+                    System.err.println("[COORDINATOR] Error updating node loads: " + e.getMessage());
+                }
             }
-        }, 0, 2000); // Update every 2 seconds
+        }, 5000, LOAD_UPDATE_INTERVAL); // Start after 5 seconds, then update every LOAD_UPDATE_INTERVAL
     }
 
     private void startHealthChecks() {
@@ -84,54 +96,88 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             NodeInfo node = nodeInfoMap.get(i);
             if (node != null && node.isActive) {
                 try (Socket socket = new Socket()) {
-                    socket.connect(new InetSocketAddress(node.host, node.port), 1000);
+                    socket.connect(new InetSocketAddress(node.host, node.port), CONNECTION_TIMEOUT);
+                    socket.setSoTimeout(SOCKET_TIMEOUT);
+                    socket.setKeepAlive(true);
+                    socket.setTcpNoDelay(true);
+                    socket.setReceiveBufferSize(8192);
+                    socket.setSendBufferSize(8192);
+
                     ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                    out.flush();
                     ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
-                    
+
                     out.writeUTF("getLoad");
                     out.flush();
-                    
+
                     int load = in.readInt();
                     if (load != node.currentLoad) {
                         node.currentLoad = load;
+                        lastSuccessfulLoadUpdate.put(i, System.currentTimeMillis());
                         System.out.println("[COORDINATOR] Node " + i + " load: " + load + " connections");
                     }
                 } catch (IOException e) {
                     System.err.println("[COORDINATOR] Failed to update load for node " + i + ": " + e.getMessage());
+                    // Reset load to 0 if we can't get the load
+                    if (node.currentLoad != 0) {
+                        node.currentLoad = 0;
+                        System.out.println("[COORDINATOR] Reset node " + i + " load to 0 due to connection failure");
+                    }
                 }
+            } else if (node != null && !node.isActive && node.currentLoad != 0) {
+                // Reset load for inactive nodes
+                node.currentLoad = 0;
+                System.out.println("[COORDINATOR] Reset inactive node " + i + " load to 0");
             }
         }
     }
 
     private void checkNodeHealth() {
         for (int i = 0; i < nodeInfoMap.size(); i++) {
-            NodeInfo node = nodeInfoMap.get(i);
+            final int nodeId = i;
+            NodeInfo node = nodeInfoMap.get(nodeId);
             if (node != null) {
                 try (Socket socket = new Socket()) {
-                    socket.connect(new InetSocketAddress(node.host, node.port), 1000);
+                    socket.connect(new InetSocketAddress(node.host, node.port), CONNECTION_TIMEOUT);
+                    socket.setSoTimeout(SOCKET_TIMEOUT);
+                    socket.setKeepAlive(true);
+                    socket.setTcpNoDelay(true);
+                    socket.setReceiveBufferSize(8192);
+                    socket.setSendBufferSize(8192);
+
                     ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                    out.flush();
                     ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
-                    
+
                     out.writeUTF("ping");
                     out.flush();
-                    
+
                     String response = in.readUTF();
                     if ("pong".equals(response)) {
                         if (!node.isActive) {
-                            System.out.println("[COORDINATOR] Node " + i + " is back online");
+                            System.out.println("[COORDINATOR] Node " + nodeId + " is back online");
                             node.isActive = true;
                             node.failureCount = 0;
+                            consecutiveFailures.put(nodeId, 0);
+                            nodeRecoveryInProgress.remove(nodeId);
                         }
+                        lastSuccessfulHealthCheck.put(nodeId, System.currentTimeMillis());
                     }
                 } catch (IOException e) {
                     if (node.isActive) {
-                        node.failureCount++;
-                        System.err.println("[COORDINATOR] Node " + i + " health check failed: " + e.getMessage());
-                        if (node.failureCount >= 3) {
-                            System.err.println("[COORDINATOR] Node " + i + " marked as offline after " + node.failureCount + " failures");
+                        int failures = consecutiveFailures.getOrDefault(nodeId, 0) + 1;
+                        consecutiveFailures.put(nodeId, failures);
+                        System.err.println("[COORDINATOR] Node " + nodeId + " health check failed: " + e.getMessage() +
+                                " (Consecutive failures: " + failures + ")");
+
+                        if (failures >= MAX_FAILURES) {
+                            System.err.println("[COORDINATOR] Node " + nodeId + " marked as offline after " + failures + " consecutive failures");
                             node.isActive = false;
-                            // Redistribute files from failed node
-                            redistributeFilesFromNode(i);
+                            node.currentLoad = 0; // Reset load when node goes offline
+                            if (!nodeRecoveryInProgress.getOrDefault(nodeId, false)) {
+                                nodeRecoveryInProgress.put(nodeId, true);
+                                new Thread(() -> redistributeFilesFromNode(nodeId)).start();
+                            }
                         }
                     }
                 }
@@ -146,95 +192,88 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         String failedNodeAddress = failedNode.host + ":" + failedNode.port;
         List<String> filesToRedistribute = new ArrayList<>();
 
-        // Find all files stored on the failed node
+        // Find all files stored on the failed node (may be in a list of locations)
         for (Map.Entry<String, String> entry : fileLocationMap.entrySet()) {
-            if (entry.getValue().equals(failedNodeAddress)) {
-                filesToRedistribute.add(entry.getKey());
+            String[] locations = entry.getValue().split(",");
+            for (String loc : locations) {
+                if (loc.equals(failedNodeAddress)) {
+                    filesToRedistribute.add(entry.getKey());
+                    break;
+                }
             }
         }
 
         System.out.println("[COORDINATOR] Attempting to recover " + filesToRedistribute.size() + " files from failed node " + failedNodeId);
 
-        // First try to recover files from the failed node before it goes offline
         for (String fileKey : filesToRedistribute) {
             String[] parts = fileKey.split("/");
             String department = parts[0];
             String filename = parts[1];
-
-            // Try to get file from failed node first
-            try (Socket socket = new Socket()) {
-                socket.connect(new InetSocketAddress(failedNode.host, failedNode.port), 1000);
-                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
-
-                out.writeUTF("fetch");
-                out.writeUTF(department);
-                out.writeUTF(filename);
-                out.flush();
-
-                byte[] data = (byte[]) in.readObject();
-                if (data != null && data.length > 0) {
-                    // Find a new node to store the file
-                    for (int i = 0; i < nodeInfoMap.size(); i++) {
-                        if (i != failedNodeId) {
-                            NodeInfo node = nodeInfoMap.get(i);
-                            if (node != null && node.isActive) {
-                                try (Socket newSocket = new Socket()) {
-                                    newSocket.connect(new InetSocketAddress(node.host, node.port), 1000);
-                                    ObjectOutputStream newOut = new ObjectOutputStream(newSocket.getOutputStream());
-                                    ObjectInputStream newIn = new ObjectInputStream(newSocket.getInputStream());
-
-                                    newOut.writeUTF("add");
-                                    newOut.writeUTF(department);
-                                    newOut.writeUTF(filename);
-                                    newOut.writeObject(data);
-                                    newOut.flush();
-
-                                    boolean success = newIn.readBoolean();
-                                    if (success) {
-                                        fileLocationMap.put(fileKey, node.host + ":" + node.port);
-                                        System.out.println("[COORDINATOR] Successfully recovered and redistributed file " + filename + " to node " + i);
-                                        break;
-                                    }
-                                } catch (Exception e) {
-                                    System.err.println("[COORDINATOR] Failed to redistribute file " + filename + " to node " + i);
-                                }
-                            }
+            byte[] data = null;
+            // Try to get file from any other node that has it
+            String[] locations = fileLocationMap.get(fileKey).split(",");
+            for (String loc : locations) {
+                if (!loc.equals(failedNodeAddress)) {
+                    String[] hostPort = loc.split(":");
+                    String host = hostPort[0];
+                    int port = Integer.parseInt(hostPort[1]);
+                    try (Socket socket = new Socket()) {
+                        socket.connect(new InetSocketAddress(host, port), CONNECTION_TIMEOUT);
+                        socket.setSoTimeout(SOCKET_TIMEOUT);
+                        ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                        ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+                        out.writeUTF("fetch");
+                        out.writeUTF(department);
+                        out.writeUTF(filename);
+                        out.flush();
+                        data = (byte[]) in.readObject();
+                        if (data != null && data.length > 0) {
+                            System.out.println("[COORDINATOR] Recovered file " + filename + " from backup node " + host + ":" + port);
+                            break;
                         }
+                    } catch (Exception e) {
+                        System.err.println("[COORDINATOR] Failed to recover file " + filename + " from backup node " + host + ":" + port);
                     }
                 }
-            } catch (Exception e) {
-                System.err.println("[COORDINATOR] Failed to recover file " + filename + " from failed node " + failedNodeId);
-                
-                // If failed to get from failed node, try other nodes as backup
+            }
+            // If recovered, redistribute to another active node
+            if (data != null && data.length > 0) {
                 for (int i = 0; i < nodeInfoMap.size(); i++) {
                     if (i != failedNodeId) {
                         NodeInfo node = nodeInfoMap.get(i);
                         if (node != null && node.isActive) {
-                            try (Socket socket = new Socket()) {
-                                socket.connect(new InetSocketAddress(node.host, node.port), 1000);
-                                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-                                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
-
-                                out.writeUTF("fetch");
-                                out.writeUTF(department);
-                                out.writeUTF(filename);
-                                out.flush();
-
-                                byte[] data = (byte[]) in.readObject();
-                                if (data != null && data.length > 0) {
-                                    fileLocationMap.put(fileKey, node.host + ":" + node.port);
-                                    System.out.println("[COORDINATOR] Recovered file " + filename + " from backup node " + i);
+                            try (Socket newSocket = new Socket()) {
+                                newSocket.connect(new InetSocketAddress(node.host, node.port), CONNECTION_TIMEOUT);
+                                newSocket.setSoTimeout(SOCKET_TIMEOUT);
+                                ObjectOutputStream newOut = new ObjectOutputStream(newSocket.getOutputStream());
+                                ObjectInputStream newIn = new ObjectInputStream(newSocket.getInputStream());
+                                newOut.writeUTF("add");
+                                newOut.writeUTF(department);
+                                newOut.writeUTF(filename);
+                                newOut.writeObject(data);
+                                newOut.flush();
+                                boolean success = newIn.readBoolean();
+                                if (success) {
+                                    // Update fileLocationMap to include the new node
+                                    String newLoc = node.host + ":" + node.port;
+                                    Set<String> updatedLocs = new HashSet<>(Arrays.asList(locations));
+                                    updatedLocs.add(newLoc);
+                                    updatedLocs.remove(failedNodeAddress);
+                                    fileLocationMap.put(fileKey, String.join(",", updatedLocs));
+                                    System.out.println("[COORDINATOR] Successfully redistributed file " + filename + " to node " + i);
                                     break;
                                 }
-                            } catch (Exception ex) {
-                                System.err.println("[COORDINATOR] Failed to recover file " + filename + " from backup node " + i);
+                            } catch (Exception e) {
+                                System.err.println("[COORDINATOR] Failed to redistribute file " + filename + " to node " + i);
                             }
                         }
                     }
                 }
+            } else {
+                System.err.println("[COORDINATOR] Failed to recover file " + filename + " from any backup node");
             }
         }
+        nodeRecoveryInProgress.remove(failedNodeId);
     }
 
     @Override
@@ -291,7 +330,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             // Get active nodes and their current loads
             List<Integer> activeNodes = new ArrayList<>();
             Map<Integer, Integer> nodeLoads = new HashMap<>();
-            
             for (int i = 0; i < nodeInfoMap.size(); i++) {
                 NodeInfo node = nodeInfoMap.get(i);
                 if (node != null && node.isActive) {
@@ -305,10 +343,55 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
                 return false;
             }
 
-            // Select the node with the lowest load
+            // For add: replicate to 2 least-loaded nodes
+            if (action.equalsIgnoreCase("add")) {
+                // Sort nodes by load
+                activeNodes.sort(Comparator.comparingInt(nodeLoads::get));
+                int replicationFactor = Math.min(2, activeNodes.size());
+                List<String> locations = new ArrayList<>();
+                boolean allSuccess = true;
+                for (int i = 0; i < replicationFactor; i++) {
+                    int nodeId = activeNodes.get(i);
+                    NodeInfo node = nodeInfoMap.get(nodeId);
+                    try (Socket socket = new Socket()) {
+                        socket.connect(new InetSocketAddress(node.host, node.port), 3000);
+                        socket.setSoTimeout(3000);
+                        ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                        ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+                        out.writeUTF("add");
+                        out.writeUTF(department);
+                        out.writeUTF(filename);
+                        out.writeObject(content);
+                        out.flush();
+                        boolean success = in.readBoolean();
+                        if (success) {
+                            locations.add(node.host + ":" + node.port);
+                            System.out.println("[COORDINATOR] File replicated to node " + nodeId);
+                        } else {
+                            System.err.println("[COORDINATOR] Node " + nodeId + " reported operation failure");
+                            allSuccess = false;
+                        }
+                    } catch (Exception e) {
+                        System.err.println("[COORDINATOR] Error with node " + nodeId + ": " + e.getMessage());
+                        node.failureCount++;
+                        if (node.failureCount >= 3) {
+                            System.err.println("[COORDINATOR] Node " + nodeId + " marked as offline after " + node.failureCount + " failures");
+                            node.isActive = false;
+                            redistributeFilesFromNode(nodeId);
+                        }
+                        allSuccess = false;
+                    }
+                }
+                if (!locations.isEmpty()) {
+                    fileLocationMap.put(department + "/" + filename, String.join(",", locations));
+                }
+                return allSuccess;
+            }
+
+            // For other actions, use the least-loaded node
             int selectedNode = activeNodes.stream()
-                .min(Comparator.comparingInt(nodeLoads::get))
-                .orElse(-1);
+                    .min(Comparator.comparingInt(nodeLoads::get))
+                    .orElse(-1);
 
             if (selectedNode == -1) {
                 System.err.println("[COORDINATOR] Failed to select a node.");
@@ -339,7 +422,7 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
                 boolean success = in.readBoolean();
 
                 if (success) {
-                    if (action.equalsIgnoreCase("add")) {
+                    if (action.equalsIgnoreCase("edit") || action.equalsIgnoreCase("delete")) {
                         fileLocationMap.put(department + "/" + filename, node.host + ":" + node.port);
                         System.out.println("[COORDINATOR] File operation completed successfully on node " + selectedNode);
                     } else {
@@ -349,7 +432,7 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
                 } else {
                     System.err.println("[COORDINATOR] Node " + selectedNode + " reported operation failure");
                 }
-            } catch (IOException e) {
+            } catch (Exception e) {
                 System.err.println("[COORDINATOR] Error with node " + selectedNode + ": " + e.getMessage());
                 node.failureCount++;
                 if (node.failureCount >= 3) {
@@ -373,63 +456,78 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         }
 
         String key = department + "/" + filename;
-        String location = fileLocationMap.get(key);
-
-        if (location != null) {
-            try {
-                String[] parts = location.split(":");
-                String host = parts[0];
-                int port = Integer.parseInt(parts[1]);
-
+        String locationList = fileLocationMap.get(key);
+        if (locationList != null) {
+            String[] locations = locationList.split(",");
+            // Build a list of node indices and their loads for nodes that have the file
+            List<Integer> candidateNodes = new ArrayList<>();
+            Map<Integer, Integer> nodeLoads = new HashMap<>();
+            for (String loc : locations) {
+                for (int i = 0; i < nodeInfoMap.size(); i++) {
+                    NodeInfo node = nodeInfoMap.get(i);
+                    if (node != null && node.isActive && (node.host + ":" + node.port).equals(loc)) {
+                        candidateNodes.add(i);
+                        nodeLoads.put(i, node.currentLoad);
+                    }
+                }
+            }
+            if (!candidateNodes.isEmpty()) {
+                // Sort candidate nodes by load (ascending)
+                candidateNodes.sort(Comparator.comparingInt(nodeLoads::get));
+                // Try each node in order of least load
+                for (int nodeId : candidateNodes) {
+                    NodeInfo node = nodeInfoMap.get(nodeId);
+                    try (Socket socket = new Socket()) {
+                        socket.connect(new InetSocketAddress(node.host, node.port), 10000);
+                        socket.setSoTimeout(10000);
+                        ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                        out.flush();
+                        ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+                        out.writeUTF("fetch");
+                        out.writeUTF(department);
+                        out.writeUTF(filename);
+                        out.flush();
+                        byte[] data = (byte[]) in.readObject();
+                        if (data != null && data.length > 0) {
+                            System.out.println("[COORDINATOR] File " + key + " served from node " + nodeId + " (Load: " + node.currentLoad + ")");
+                            System.out.println("File locations for " + key + ": " + fileLocationMap.get(key));
+                            return data;
+                        }
+                    } catch (Exception e) {
+                        System.err.println("[COORDINATOR] Node " + nodeId + " error: " + e.getMessage());
+                    }
+                }
+            }
+        }
+        // Fallback: try all active nodes if not found in fileLocationMap
+        System.out.println("[COORDINATOR] Fallback: trying all active nodes for file: " + key);
+        for (int i = 0; i < nodeInfoMap.size(); i++) {
+            NodeInfo node = nodeInfoMap.get(i);
+            if (node != null && node.isActive) {
                 try (Socket socket = new Socket()) {
-                    socket.connect(new InetSocketAddress(host, port), 3000);
-                    socket.setSoTimeout(3000);
-
+                    socket.connect(new InetSocketAddress(node.host, node.port), 10000);
+                    socket.setSoTimeout(10000);
                     ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
                     out.flush();
                     ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
-
                     out.writeUTF("fetch");
                     out.writeUTF(department);
                     out.writeUTF(filename);
                     out.flush();
-
-                    return (byte[]) in.readObject();
+                    byte[] data = (byte[]) in.readObject();
+                    if (data != null && data.length > 0) {
+                        System.out.println("[COORDINATOR] Fallback: file " + key + " found on node " + i);
+                        // Update fileLocationMap for future requests
+                        fileLocationMap.put(key, node.host + ":" + node.port);
+                        System.out.println("File locations for " + key + ": " + fileLocationMap.get(key));
+                        return data;
+                    }
+                } catch (Exception e) {
+                    System.err.println("[COORDINATOR] Node " + i + " error: " + e.getMessage());
                 }
-            } catch (Exception e) {
-                System.err.println("[COORDINATOR] Failed to contact node for file: " + e.getMessage());
             }
         }
-
-        for (int i = 0; i < nodeAddresses.size(); i++) {
-            if (!nodeStatus.getOrDefault(i, true)) continue;
-
-            String host = nodeAddresses.get(i);
-            int port = nodePorts.get(i);
-
-            try (Socket socket = new Socket()) {
-                socket.connect(new InetSocketAddress(host, port), 3000);
-                socket.setSoTimeout(3000);
-
-                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-                out.flush();
-
-                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
-
-                out.writeUTF("fetch");
-                out.writeUTF(department);
-                out.writeUTF(filename);
-                out.flush();
-
-                byte[] data = (byte[]) in.readObject();
-                if (data != null && data.length > 0) {
-                    fileLocationMap.put(key, host + ":" + port); // cache it
-                    return data;
-                }
-            } catch (Exception e) {
-                System.out.println("[COORDINATOR] Node " + i + " error: " + e.getMessage());
-            }
-        }
+        System.out.println("[COORDINATOR] File " + key + " not found on any available node");
         return new byte[0];
     }
 
@@ -465,7 +563,7 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         System.out.println("[COORDINATOR] Attempting to list files in " + department);
         List<String> result = new ArrayList<>();
 
-        // Get a random active node
+        // Get active nodes
         List<Integer> activeNodes = new ArrayList<>();
         for (int i = 0; i < nodeInfoMap.size(); i++) {
             NodeInfo node = nodeInfoMap.get(i);
@@ -479,32 +577,61 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             return List.of("No available nodes");
         }
 
-        int selectedNode = activeNodes.get(new Random().nextInt(activeNodes.size()));
-        System.out.println("[COORDINATOR] Selected node " + selectedNode + " for listing files");
-        NodeInfo node = nodeInfoMap.get(selectedNode);
+        // Try each active node until we get a successful response
+        for (int nodeId : activeNodes) {
+            NodeInfo node = nodeInfoMap.get(nodeId);
+            System.out.println("[COORDINATOR] Trying node " + nodeId + " for listing files");
 
-        try (Socket socket = new Socket(node.host, node.port);
-             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-             ObjectInputStream in = new ObjectInputStream(socket.getInputStream())) {
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(node.host, node.port), 10000);
+                socket.setSoTimeout(10000);
+                socket.setKeepAlive(true);
+                socket.setTcpNoDelay(true);
 
-            System.out.println("[COORDINATOR] Connected to node " + selectedNode + " for listing files");
-            
-            out.writeUTF("list");
-            out.writeUTF(department);
-            out.flush();
+                ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+                out.flush();
+                ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
-            @SuppressWarnings("unchecked")
-            List<String> files = (List<String>) in.readObject();
-            if (files != null) {
-                result.addAll(files);
-                System.out.println("[COORDINATOR] Retrieved " + files.size() + " files from node " + selectedNode);
-            } else {
-                System.out.println("[COORDINATOR] Received null file list from node " + selectedNode);
+                System.out.println("[COORDINATOR] Connected to node " + nodeId + " for listing files");
+
+                out.writeUTF("list");
+                out.writeUTF(department);
+                out.flush();
+
+                // Add retry logic for reading the response
+                int retries = 3;
+                while (retries > 0) {
+                    try {
+                        @SuppressWarnings("unchecked")
+                        List<String> files = (List<String>) in.readObject();
+                        if (files != null) {
+                            result.addAll(files);
+                            System.out.println("[COORDINATOR] Retrieved " + files.size() + " files from node " + nodeId);
+                            if (!result.isEmpty()) {
+                                return result; // Return if we found any files
+                            }
+                        }
+                        break; // Break the retry loop if we got a response
+                    } catch (Exception e) {
+                        retries--;
+                        if (retries > 0) {
+                            System.out.println("[COORDINATOR] Retrying read from node " + nodeId + " (" + retries + " attempts left)");
+                            Thread.sleep(1000);
+                            continue;
+                        }
+                        System.err.println("[COORDINATOR] Error reading from node " + nodeId + ": " + e.getMessage());
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("[COORDINATOR] Error connecting to node " + nodeId + ": " + e.getMessage());
+                continue;
             }
-        } catch (Exception e) {
-            System.err.println("[COORDINATOR] Error listing files from node " + selectedNode + ": " + e.getMessage());
-            e.printStackTrace();
-            return List.of("Error retrieving file list: " + e.getMessage());
+        }
+
+        // If we get here, either all nodes failed or no files were found
+        if (result.isEmpty()) {
+            System.out.println("[COORDINATOR] No files found in any node");
+            return List.of("No files found");
         }
 
         return result;
