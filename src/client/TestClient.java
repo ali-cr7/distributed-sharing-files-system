@@ -1,6 +1,9 @@
 package client;
 
-import server.CoordinatorService;
+import server.interfaces.UserManagementService;
+import server.interfaces.FileOperationService;
+import server.interfaces.FileLockingService;
+import server.interfaces.UserListingService;
 import java.io.*;
 import java.net.Socket;
 import java.rmi.registry.LocateRegistry;
@@ -15,11 +18,9 @@ public class TestClient {
     private static final List<String> ALLOWED_DEPARTMENTS = List.of("QA", "Graphic", "Development", "general");
     private static String currentUsername = "";
     private static String currentRole = "";
-
     // Track active load connections
     private static final List<LoadConnection> activeConnections = new ArrayList<>();
     private static final AtomicBoolean stopRequested = new AtomicBoolean(false);
-
     private static class LoadConnection {
         final Thread thread;
         final Socket socket;
@@ -29,8 +30,7 @@ public class TestClient {
             this.socket = socket;
         }
     }
-
-    private static void createRealLoad(Scanner scanner, CoordinatorService service) {
+    private static void createRealLoad(Scanner scanner, FileOperationService service) {
         try {
             System.out.print("Enter node port (5001/5002/5003): ");
             int port = Integer.parseInt(scanner.nextLine());
@@ -80,7 +80,6 @@ public class TestClient {
             System.out.println("Error creating load: " + e.getMessage());
         }
     }
-
     private static void clearActiveConnections() {
         synchronized (activeConnections) {
             for (LoadConnection conn : activeConnections) {
@@ -96,39 +95,30 @@ public class TestClient {
             activeConnections.clear();
         }
     }
-
     private static void removeConnection(Thread thread) {
         synchronized (activeConnections) {
             activeConnections.removeIf(conn -> conn.thread == thread);
         }
     }
-
-    private static void stopAllLoad() {
-        stopRequested.set(true);
-        clearActiveConnections();
-        System.out.println("All load connections stopped");
-    }
-
-    private static void showActiveLoadStats() {
-        synchronized (activeConnections) {
-            System.out.println("Currently active load connections: " + activeConnections.size());
-        }
-    }
-
     public static void main(String[] args) {
         try (Scanner scanner = new Scanner(System.in)) {
             Registry registry = LocateRegistry.getRegistry("localhost", 1099);
-            CoordinatorService service = (CoordinatorService) registry.lookup("CoordinatorService");
+            
+            // Get all required services
+            UserManagementService userService = (UserManagementService) registry.lookup("UserManagementService");
+            FileOperationService fileService = (FileOperationService) registry.lookup("FileOperationService");
+            FileLockingService lockService = (FileLockingService) registry.lookup("FileLockingService");
+            UserListingService listingService = (UserListingService) registry.lookup("UserListingService");
 
             // Try to login as admin first
-            String token = service.login("admin", "admin123");
+            String token = userService.login("admin", "admin123");
 
             // If admin doesn't exist, create it
             if (token == null) {
                 System.out.println("Admin account not found. Creating default admin...");
-                boolean created = service.registerUser("", "admin", "admin123", "manager", "general");
+                boolean created = userService.registerUser("", "admin", "admin123", "manager", "general");
                 if (created) {
-                    token = service.login("admin", "admin123");
+                    token = userService.login("admin", "admin123");
                     System.out.println("Default admin created successfully!");
                 } else {
                     System.out.println("Failed to create admin account!");
@@ -142,7 +132,6 @@ public class TestClient {
 
             // Main application loop
             while (true) {
-
                 System.out.println("\n===== Main Menu ===== [" + currentUsername + " - " + currentRole + "]");
                 System.out.println("1) File Operations");
                 System.out.println("2) Download File");
@@ -151,7 +140,6 @@ public class TestClient {
                     System.out.println("3) User Management");
                     System.out.println("4) List All Users");
                     System.out.println("5) Create Real Load (Socket Connections)");
-
                 }
 
                 System.out.println("0) Logout");
@@ -162,16 +150,16 @@ public class TestClient {
 
                     switch (choice) {
                         case 1: // File operations
-                            handleFileOperations(scanner, service, token);
+                            handleFileOperations(scanner, fileService, lockService, token);
                             break;
 
                         case 2: // Download file
-                            handleFileDownloadWithList(scanner, service, token);
+                            handleFileDownloadWithList(scanner, fileService, token);
                             break;
 
                         case 3: // User management (admin only)
                             if (currentRole.equals("manager")) {
-                                handleUserManagement(scanner, service, token);
+                                handleUserManagement(scanner, userService, token);
                             } else {
                                 System.out.println("Access denied!");
                             }
@@ -179,19 +167,20 @@ public class TestClient {
 
                         case 4: // List users (admin only)
                             if (currentRole.equals("manager")) {
-                                listAllUsers(service, token);
+                                listAllUsers(listingService, token);
                             } else {
                                 System.out.println("Access denied!");
                             }
                             break;
+
                         case 5:
                             if (currentRole.equals("manager")) {
-                                createRealLoad(scanner, service);
+                                createRealLoad(scanner, fileService);
                             }
                             break;
 
                         case 0: // Logout
-                            token = showLoginScreen(scanner, service);
+                            token = showLoginScreen(scanner, userService);
                             if (token == null) return;
                             break;
 
@@ -207,8 +196,7 @@ public class TestClient {
             e.printStackTrace();
         }
     }
-
-    private static String showLoginScreen(Scanner scanner, CoordinatorService service) throws Exception {
+    private static String showLoginScreen(Scanner scanner, UserManagementService service) throws Exception {
         while (true) {
             System.out.println("\n=== Distributed File System ===");
             System.out.println("1) Admin Login");
@@ -257,7 +245,7 @@ public class TestClient {
             }
         }
     }
-    private static void handleFileDownloadWithList(Scanner scanner, CoordinatorService service, String token) {
+    private static void handleFileDownloadWithList(Scanner scanner, FileOperationService service, String token) {
         try {
             // Get department
             String department;
@@ -322,7 +310,7 @@ public class TestClient {
             System.out.println("Error during download: " + e.getMessage());
         }
     }
-    private static void handleFileOperations(Scanner scanner, CoordinatorService service, String token) throws Exception {
+    private static void handleFileOperations(Scanner scanner, FileOperationService fileService, FileLockingService lockService, String token) throws Exception {
         System.out.println("\n=== File Operations ===");
         System.out.print("Action (add/edit/delete/list): ");
         String action = scanner.nextLine().toLowerCase();
@@ -334,7 +322,7 @@ public class TestClient {
         } while (!ALLOWED_DEPARTMENTS.contains(department));
 
         if (action.equals("list")) {
-            List<String> files = service.listFiles(token, department);
+            List<String> files = fileService.listFiles(token, department);
             if (files.isEmpty()) {
                 System.out.println("No files found in " + department + " department.");
                 return;
@@ -348,7 +336,7 @@ public class TestClient {
 
         if (action.equals("edit")) {
             // List available files
-            List<String> files = service.listFiles(token, department);
+            List<String> files = fileService.listFiles(token, department);
             if (files.isEmpty()) {
                 System.out.println("No files found in " + department + " department.");
                 return;
@@ -372,38 +360,48 @@ public class TestClient {
 
             String filename = files.get(selection-1);
 
-            // Show current content
-            System.out.println("\n=== Current File Content ===");
-            byte[] currentContent = service.requestFile(token, filename, department);
-            if (currentContent != null && currentContent.length > 0) {
-                System.out.println(new String(currentContent));
-            } else {
-                System.out.println("(Empty file)");
-            }
-            System.out.println("=== End of Current Content ===\n");
-
-            // Get new content
-            System.out.println("Enter new content (type 'END' on a new line to finish):");
-            System.out.println("----------------------------------------");
-            StringBuilder newContent = new StringBuilder();
-            String line;
-            while (!(line = scanner.nextLine()).equals("END")) {
-                newContent.append(line).append("\n");
-            }
-            System.out.println("----------------------------------------");
-
-            // Confirm edit
-            System.out.print("\nDo you want to save these changes? (yes/no): ");
-            String confirm = scanner.nextLine().toLowerCase();
-            if (!confirm.equals("yes")) {
-                System.out.println("Edit cancelled.");
+            // Try to lock the file for editing
+            if (!lockService.lockFileForEdit(token, filename, department)) {
+                System.out.println("File is currently being edited by another user. Try again later.");
                 return;
             }
 
-            // Send edit command
-            boolean result = service.sendFileCommand(token, "edit", filename, department,
-                    newContent.toString().getBytes());
-            System.out.println(result ? "File edited successfully!" : "Edit operation failed!");
+            try {
+                // Show current content
+                System.out.println("\n=== Current File Content ===");
+                byte[] currentContent = fileService.requestFile(token, filename, department);
+                if (currentContent != null && currentContent.length > 0) {
+                    System.out.println(new String(currentContent));
+                } else {
+                    System.out.println("(Empty file)");
+                }
+                System.out.println("=== End of Current Content ===\n");
+
+                // Get new content
+                System.out.println("Enter new content (type 'END' on a new line to finish):");
+                System.out.println("----------------------------------------");
+                StringBuilder newContent = new StringBuilder();
+                String line;
+                while (!(line = scanner.nextLine()).equals("END")) {
+                    newContent.append(line).append("\n");
+                }
+                System.out.println("----------------------------------------");
+
+                // Confirm edit
+                System.out.print("\nDo you want to save these changes? (yes/no): ");
+                String confirm = scanner.nextLine().toLowerCase();
+                if (!confirm.equals("yes")) {
+                    System.out.println("Edit cancelled.");
+                    return;
+                }
+
+                // Send edit command
+                boolean result = fileService.sendFileCommand(token, "edit", filename, department,
+                        newContent.toString().getBytes());
+                System.out.println(result ? "File edited successfully!" : "Edit operation failed!");
+            } finally {
+                lockService.unlockFileForEdit(token, filename, department);
+            }
             return;
         }
 
@@ -424,10 +422,10 @@ public class TestClient {
             content = fileContent.toString().getBytes();
         }
 
-        boolean result = service.sendFileCommand(token, action, filename, department, content);
+        boolean result = fileService.sendFileCommand(token, action, filename, department, content);
         System.out.println(result ? "Operation successful!" : "Operation failed (check permissions)");
     }
-    private static void handleUserManagement(Scanner scanner, CoordinatorService service, String token) throws Exception {
+    private static void handleUserManagement(Scanner scanner, UserManagementService service, String token) throws Exception {
         System.out.println("\n=== User Management ===");
         System.out.print("Username: ");
         String username = scanner.nextLine();
@@ -445,7 +443,7 @@ public class TestClient {
         boolean success = service.registerUser(token, username, password, role, department);
         System.out.println(success ? "User registered successfully!" : "Registration failed!");
     }
-    private static void listAllUsers(CoordinatorService service, String token) throws Exception {
+    private static void listAllUsers(UserListingService service, String token) throws Exception {
         System.out.println("\n=== User List ===");
         List<String> users = service.listUsers(token);
         if (users.isEmpty() || users.get(0).contains("Access Denied")) {
