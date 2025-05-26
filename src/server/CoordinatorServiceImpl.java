@@ -3,7 +3,6 @@ package server;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
-import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.rmi.RemoteException;
@@ -20,16 +19,9 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             username = u; password = p; role = r; department = d;
         }
     }
-
     private final Map<String, User> users = new ConcurrentHashMap<>();
     private final Map<String, String> activeTokens = new ConcurrentHashMap<>();
-    private final Map<Integer, Integer> nodeConnections = new ConcurrentHashMap<>();
-    private final List<String> nodeAddresses = List.of("localhost", "localhost", "localhost");
-    private final List<Integer> nodePorts = List.of(5001, 5002, 5003);
-
     private final Map<String, String> fileLocationMap = new ConcurrentHashMap<>();
-    private final Map<Integer, Integer> nodeLoad = new ConcurrentHashMap<>();
-    private final Map<Integer, Boolean> nodeStatus = new ConcurrentHashMap<>();
     private final Map<Integer, NodeInfo> nodeInfoMap = new ConcurrentHashMap<>();
     private final LoadBalancer loadBalancer = new LoadBalancer();
     private Timer loadUpdateTimer;
@@ -44,14 +36,13 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
     private final Map<Integer, Long> lastSuccessfulLoadUpdate = new ConcurrentHashMap<>();
     private final Map<Integer, Integer> consecutiveFailures = new ConcurrentHashMap<>();
     private final Map<Integer, Boolean> nodeRecoveryInProgress = new ConcurrentHashMap<>();
-
+    private final Map<String, String> fileEditLocks = new ConcurrentHashMap<>();
     protected CoordinatorServiceImpl() throws RemoteException {
         super();
         initializeNodes();
         startLoadUpdates();
         startHealthChecks();
     }
-
     private void initializeNodes() {
         List<String> addresses = List.of("localhost", "localhost", "localhost");
         List<Integer> ports = List.of(5001, 5002, 5003);
@@ -66,7 +57,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             loadBalancer.addNode(i);
         }
     }
-
     private void startLoadUpdates() {
         loadUpdateTimer = new Timer(true);
         loadUpdateTimer.scheduleAtFixedRate(new TimerTask() {
@@ -80,7 +70,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             }
         }, 5000, LOAD_UPDATE_INTERVAL); // Start after 5 seconds, then update every LOAD_UPDATE_INTERVAL
     }
-
     private void startHealthChecks() {
         healthCheckTimer = new Timer(true);
         healthCheckTimer.scheduleAtFixedRate(new TimerTask() {
@@ -90,7 +79,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             }
         }, 0, HEALTH_CHECK_INTERVAL);
     }
-
     private void updateNodeLoads() {
         for (int i = 0; i < nodeInfoMap.size(); i++) {
             NodeInfo node = nodeInfoMap.get(i);
@@ -131,7 +119,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             }
         }
     }
-
     private void checkNodeHealth() {
         for (int i = 0; i < nodeInfoMap.size(); i++) {
             final int nodeId = i;
@@ -184,7 +171,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             }
         }
     }
-
     private void redistributeFilesFromNode(int failedNodeId) {
         NodeInfo failedNode = nodeInfoMap.get(failedNodeId);
         if (failedNode == null) return;
@@ -275,7 +261,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         }
         nodeRecoveryInProgress.remove(failedNodeId);
     }
-
     @Override
     public boolean registerUser(String token, String username, String password, String role, String department) throws RemoteException {
         if (users.isEmpty() && username.equals("admin") && role.equals("manager")) {
@@ -296,7 +281,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         users.put(username, new User(username, password, role, department));
         return true;
     }
-
     @Override
     public String login(String username, String password) throws RemoteException {
         User user = users.get(username);
@@ -305,7 +289,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         activeTokens.put(token, username);
         return token;
     }
-
     @Override
     public boolean hasPermission(String token, String action, String department) throws RemoteException {
         String username = activeTokens.get(token);
@@ -315,7 +298,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         if (user.role.equals("manager")) return true;
         return user.department.equals(department) && List.of("add", "edit", "delete", "view").contains(action);
     }
-
     @Override
     public boolean sendFileCommand(String token, String action, String filename, String department, byte[] content) throws RemoteException {
         if (!hasPermission(token, action, department)) {
@@ -325,6 +307,15 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
 
         System.out.println("[COORDINATOR] Attempting " + action + " operation for " + department + "/" + filename);
         int retries = 0;
+
+        String key = department + "/" + filename;
+        if (action.equals("edit")) {
+            String lockHolder = fileEditLocks.get(key);
+            if (lockHolder != null && !lockHolder.equals(token)) {
+                System.out.println("[COORDINATOR] Edit denied: file is locked by another user.");
+                return false;
+            }
+        }
 
         while (retries < MAX_RETRIES) {
             // Get active nodes and their current loads
@@ -447,7 +438,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         System.err.println("[COORDINATOR] Failed to execute " + action + " operation after " + MAX_RETRIES + " retries");
         return false;
     }
-
     @Override
     public byte[] requestFile(String token, String filename, String department) throws RemoteException {
         if (!hasPermission(token, "view", department)) {
@@ -530,15 +520,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         System.out.println("[COORDINATOR] File " + key + " not found on any available node");
         return new byte[0];
     }
-
-    private int getLeastLoadedNode() {
-        return nodeConnections.entrySet().stream()
-                .filter(entry -> nodeStatus.getOrDefault(entry.getKey(), true))
-                .min(Comparator.comparingInt(Map.Entry::getValue))
-                .map(Map.Entry::getKey)
-                .orElse(-1);
-    }
-
     @Override
     public List<String> listUsers(String token) throws RemoteException {
         String username = activeTokens.get(token);
@@ -552,7 +533,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         }
         return result;
     }
-
     @Override
     public List<String> listFiles(String token, String department) throws RemoteException {
         if (!hasPermission(token, "view", department)) {
@@ -636,7 +616,24 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
 
         return result;
     }
-
+    @Override
+    public synchronized boolean lockFileForEdit(String token, String filename, String department) throws RemoteException {
+        String key = department + "/" + filename;
+        if (fileEditLocks.containsKey(key)) return false; // Already locked
+        fileEditLocks.put(key, token);
+        System.out.println("[COORDINATOR] File locked for edit: " + key + " by token " + token);
+        return true;
+    }
+    @Override
+    public synchronized boolean unlockFileForEdit(String token, String filename, String department) throws RemoteException {
+        String key = department + "/" + filename;
+        if (fileEditLocks.getOrDefault(key, "").equals(token)) {
+            fileEditLocks.remove(key);
+            System.out.println("[COORDINATOR] File unlocked for edit: " + key + " by token " + token);
+            return true;
+        }
+        return false;
+    }
     private static class LoadBalancer {
         private final Map<Integer, NodeStats> nodeStats = new ConcurrentHashMap<>();
         private final List<Integer> availableNodes = new CopyOnWriteArrayList<>();
@@ -650,47 +647,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             }
         }
 
-        public int selectNode() {
-            if (availableNodes.isEmpty()) {
-                System.out.println("[LoadBalancer] No available nodes!");
-                return -1;
-            }
-
-            int selectedNode = availableNodes.stream()
-                    .min(Comparator.comparingDouble(nodeId -> {
-                        NodeStats stats = nodeStats.get(nodeId);
-                        double score = (stats.activeConnections * CONNECTION_WEIGHT) +
-                                (stats.avgResponseTime * RESPONSE_TIME_WEIGHT);
-                        System.out.printf("[LoadBalancer] Node %d - Connections: %d, Avg Response: %.2fms, Score: %.2f%n",
-                                nodeId, stats.activeConnections, stats.avgResponseTime, score);
-                        return score;
-                    }))
-                    .orElse(-1);
-
-            System.out.printf("[LoadBalancer] Selected node %d for request%n", selectedNode);
-            return selectedNode;
-        }
-
-        public void requestCompleted(int nodeId, long responseTime) {
-            NodeStats stats = nodeStats.get(nodeId);
-            if (stats != null) {
-                stats.completedRequests++;
-                // Update moving average of response time
-                stats.avgResponseTime = (stats.avgResponseTime * (stats.completedRequests - 1) + responseTime) /
-                        stats.completedRequests;
-            }
-        }
-
-        public void nodeFailed(int nodeId) {
-            availableNodes.removeIf(id -> id == nodeId);
-            // Schedule re-check after delay
-            new Timer().schedule(new TimerTask() {
-                @Override
-                public void run() {
-                    addNode(nodeId);  // Will add back if not already present
-                }
-            }, 5000); // Retry after 5 seconds
-        }
 
         private static class NodeStats {
             int activeConnections;
@@ -704,13 +660,6 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             }
         }
     }
-
-    private static class NodeStats {
-        int completedRequests;
-        double avgResponseTime;
-        int activeConnections;
-    }
-
     private static class NodeInfo {
         String host;
         int port;

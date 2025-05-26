@@ -15,11 +15,9 @@ public class TestClient {
     private static final List<String> ALLOWED_DEPARTMENTS = List.of("QA", "Graphic", "Development", "general");
     private static String currentUsername = "";
     private static String currentRole = "";
-
     // Track active load connections
     private static final List<LoadConnection> activeConnections = new ArrayList<>();
     private static final AtomicBoolean stopRequested = new AtomicBoolean(false);
-
     private static class LoadConnection {
         final Thread thread;
         final Socket socket;
@@ -29,7 +27,6 @@ public class TestClient {
             this.socket = socket;
         }
     }
-
     private static void createRealLoad(Scanner scanner, CoordinatorService service) {
         try {
             System.out.print("Enter node port (5001/5002/5003): ");
@@ -80,7 +77,6 @@ public class TestClient {
             System.out.println("Error creating load: " + e.getMessage());
         }
     }
-
     private static void clearActiveConnections() {
         synchronized (activeConnections) {
             for (LoadConnection conn : activeConnections) {
@@ -96,25 +92,11 @@ public class TestClient {
             activeConnections.clear();
         }
     }
-
     private static void removeConnection(Thread thread) {
         synchronized (activeConnections) {
             activeConnections.removeIf(conn -> conn.thread == thread);
         }
     }
-
-    private static void stopAllLoad() {
-        stopRequested.set(true);
-        clearActiveConnections();
-        System.out.println("All load connections stopped");
-    }
-
-    private static void showActiveLoadStats() {
-        synchronized (activeConnections) {
-            System.out.println("Currently active load connections: " + activeConnections.size());
-        }
-    }
-
     public static void main(String[] args) {
         try (Scanner scanner = new Scanner(System.in)) {
             Registry registry = LocateRegistry.getRegistry("localhost", 1099);
@@ -207,7 +189,6 @@ public class TestClient {
             e.printStackTrace();
         }
     }
-
     private static String showLoginScreen(Scanner scanner, CoordinatorService service) throws Exception {
         while (true) {
             System.out.println("\n=== Distributed File System ===");
@@ -372,38 +353,48 @@ public class TestClient {
 
             String filename = files.get(selection-1);
 
-            // Show current content
-            System.out.println("\n=== Current File Content ===");
-            byte[] currentContent = service.requestFile(token, filename, department);
-            if (currentContent != null && currentContent.length > 0) {
-                System.out.println(new String(currentContent));
-            } else {
-                System.out.println("(Empty file)");
-            }
-            System.out.println("=== End of Current Content ===\n");
-
-            // Get new content
-            System.out.println("Enter new content (type 'END' on a new line to finish):");
-            System.out.println("----------------------------------------");
-            StringBuilder newContent = new StringBuilder();
-            String line;
-            while (!(line = scanner.nextLine()).equals("END")) {
-                newContent.append(line).append("\n");
-            }
-            System.out.println("----------------------------------------");
-
-            // Confirm edit
-            System.out.print("\nDo you want to save these changes? (yes/no): ");
-            String confirm = scanner.nextLine().toLowerCase();
-            if (!confirm.equals("yes")) {
-                System.out.println("Edit cancelled.");
+            // Try to lock the file for editing
+            if (!service.lockFileForEdit(token, filename, department)) {
+                System.out.println("File is currently being edited by another user. Try again later.");
                 return;
             }
 
-            // Send edit command
-            boolean result = service.sendFileCommand(token, "edit", filename, department,
-                    newContent.toString().getBytes());
-            System.out.println(result ? "File edited successfully!" : "Edit operation failed!");
+            try {
+                // Show current content
+                System.out.println("\n=== Current File Content ===");
+                byte[] currentContent = service.requestFile(token, filename, department);
+                if (currentContent != null && currentContent.length > 0) {
+                    System.out.println(new String(currentContent));
+                } else {
+                    System.out.println("(Empty file)");
+                }
+                System.out.println("=== End of Current Content ===\n");
+
+                // Get new content
+                System.out.println("Enter new content (type 'END' on a new line to finish):");
+                System.out.println("----------------------------------------");
+                StringBuilder newContent = new StringBuilder();
+                String line;
+                while (!(line = scanner.nextLine()).equals("END")) {
+                    newContent.append(line).append("\n");
+                }
+                System.out.println("----------------------------------------");
+
+                // Confirm edit
+                System.out.print("\nDo you want to save these changes? (yes/no): ");
+                String confirm = scanner.nextLine().toLowerCase();
+                if (!confirm.equals("yes")) {
+                    System.out.println("Edit cancelled.");
+                    return;
+                }
+
+                // Send edit command
+                boolean result = service.sendFileCommand(token, "edit", filename, department,
+                        newContent.toString().getBytes());
+                System.out.println(result ? "File edited successfully!" : "Edit operation failed!");
+            } finally {
+                service.unlockFileForEdit(token, filename, department);
+            }
             return;
         }
 

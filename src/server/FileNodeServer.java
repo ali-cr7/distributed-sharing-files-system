@@ -11,30 +11,25 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 class FileNodeServer {
     private final int port;
     private final File baseDir;
     private volatile boolean isOnline = true;
     private final AtomicInteger activeConnections = new AtomicInteger(0);
-    private final AtomicInteger artificialLoad = new AtomicInteger(0);
     private final Set<Socket> loadTestSockets = Collections.synchronizedSet(new HashSet<>());
     private final int SOCKET_TIMEOUT = 30000; // 30 seconds
     private final int THREAD_POOL_SIZE = 50;
-    private final int MAX_CONNECTIONS = 100;
-    private final AtomicInteger totalConnections = new AtomicInteger(0);
     private final Map<Socket, Long> connectionTimestamps = new ConcurrentHashMap<>();
     private final long CONNECTION_TIMEOUT = 10000; // Reduced to 10 seconds
-    private final int PING_INTERVAL = 5000; // 5 seconds between pings
-    private final int MAX_RETRIES = 3;
     private final ExecutorService threadPool = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
     private final Set<Socket> activeSockets = Collections.synchronizedSet(new HashSet<>());
     private final Map<Socket, Thread> socketThreads = new ConcurrentHashMap<>();
     private final Map<Socket, Boolean> validConnections = new ConcurrentHashMap<>();
-
+    private final Map<String, ReentrantReadWriteLock> fileLocks = new ConcurrentHashMap<>();
     // Define NodeInfo as a nested record
     public record NodeInfo(Thread thread, FileNodeServer server, Set<Thread> loadThreads) {}
-
     public FileNodeServer(int port, String baseDirPath) {
         this.port = port;
         this.baseDir = new File(baseDirPath);
@@ -52,7 +47,6 @@ class FileNodeServer {
             }
         }
     }
-
     private void handleClient(Socket socket) {
         Thread currentThread = Thread.currentThread();
         socketThreads.put(socket, currentThread);
@@ -73,7 +67,7 @@ class FileNodeServer {
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
             String action = in.readUTF();
-          //  System.out.println("[NODE] Received action: " + action);
+            //  System.out.println("[NODE] Received action: " + action);
 
             // Only increment connection count for valid actions
             if (isValidAction(action)) {
@@ -83,7 +77,7 @@ class FileNodeServer {
                 if (!connectionCounted) {
                     int currentLoad = activeConnections.incrementAndGet();
                     connectionCounted = true;
-                  //  System.out.println("[NODE] New valid connection. Current load: " + currentLoad);
+                    //  System.out.println("[NODE] New valid connection. Current load: " + currentLoad);
                 }
             }
 
@@ -116,7 +110,7 @@ class FileNodeServer {
                         if (!"ping".equals(nextAction)) break;
                     }
                 } catch (IOException e) {
-                  //3  System.out.println("[NODE] Error sending pong response: " + e.getMessage());
+                    //3  System.out.println("[NODE] Error sending pong response: " + e.getMessage());
                 }
                 return;
             }
@@ -164,7 +158,6 @@ class FileNodeServer {
             cleanupConnection(socket);
         }
     }
-
     private boolean isValidAction(String action) {
         return action != null && (
                 action.equals("list") ||
@@ -176,75 +169,80 @@ class FileNodeServer {
                         action.equals("fetch")
         );
     }
-
     private void handleListAction(ObjectOutputStream out, String department) throws IOException {
-        try {
-            File deptDir = new File(baseDir, department);
-            List<String> files = new ArrayList<>();
+        File deptDir = new File(baseDir, department);
+        List<String> files = new ArrayList<>();
 
-            System.out.println("[NODE] Listing files in directory: " + deptDir.getAbsolutePath());
+        System.out.println("[NODE] Listing files in directory: " + deptDir.getAbsolutePath());
 
-            if (!deptDir.exists()) {
-                boolean created = deptDir.mkdirs();
-                System.out.println("[NODE] " + (created ? "Created" : "Failed to create") + " directory: " + deptDir.getAbsolutePath());
-            }
+        if (!deptDir.exists()) {
+            boolean created = deptDir.mkdirs();
+            System.out.println("[NODE] " + (created ? "Created" : "Failed to create") + " directory: " + deptDir.getAbsolutePath());
+        }
 
-            File[] listFiles = deptDir.listFiles();
-            if (listFiles != null) {
-                for (File f : listFiles) {
-                    if (f.isFile()) {
+        // For listing, we'll use read locks for each file to ensure consistency
+        File[] listFiles = deptDir.listFiles();
+        if (listFiles != null) {
+            for (File f : listFiles) {
+                if (f.isFile()) {
+                    String fileKey = department + "/" + f.getName();
+                    ReentrantReadWriteLock lock = fileLocks.computeIfAbsent(fileKey, k -> new ReentrantReadWriteLock());
+
+                    // Acquire read lock for each file
+                    lock.readLock().lock();
+                    try {
                         files.add(f.getName());
                         System.out.println("[NODE] Found file: " + f.getName() + " (size: " + f.length() + " bytes)");
+                    } finally {
+                        lock.readLock().unlock();
                     }
                 }
             }
-
-            System.out.println("[NODE] Sending " + files.size() + " files to client");
-            out.writeObject(files);
-            out.flush();
-            System.out.println("[NODE] Successfully sent file list to client");
-        } catch (Exception e) {
-            System.err.println("[NODE] Error in handleListAction: " + e.getMessage());
-            e.printStackTrace();
-            try {
-                out.writeObject(new ArrayList<String>());
-                out.flush();
-            } catch (IOException ex) {
-                System.err.println("[NODE] Failed to send error response: " + ex.getMessage());
-            }
         }
-    }
 
-    private void handleAddEditAction(ObjectInputStream in, ObjectOutputStream out,
-                                     String department, String filename) throws Exception {
+        System.out.println("[NODE] Sending " + files.size() + " files to client");
+        out.writeObject(files);
+        out.flush();
+        System.out.println("[NODE] Successfully sent file list to client");
+    }
+    private void handleAddEditAction(ObjectInputStream in, ObjectOutputStream out, String department, String filename) throws Exception {
+        String fileKey = department + "/" + filename;
+        ReentrantReadWriteLock lock = fileLocks.computeIfAbsent(fileKey, k -> new ReentrantReadWriteLock());
+
         try {
             System.out.println("[NODE] Starting " + (new File(new File(baseDir, department), filename).exists() ? "edit" : "add") +
-                    " operation for " + department + "/" + filename);
+                    " operation for " + fileKey);
 
-            byte[] content = (byte[]) in.readObject();
-            if (content == null) {
-                System.out.println("[NODE] Received null content for file operation");
-                out.writeBoolean(false);
-                out.flush();
-                return;
-            }
+            // Acquire write lock for add/edit operations
+            lock.writeLock().lock();
+            try {
+                byte[] content = (byte[]) in.readObject();
+                if (content == null) {
+                    System.out.println("[NODE] Received null content for file operation");
+                    out.writeBoolean(false);
+                    out.flush();
+                    return;
+                }
 
-            File deptDir = new File(baseDir, department);
-            if (!deptDir.exists()) {
-                boolean created = deptDir.mkdirs();
-                System.out.println("[NODE] " + (created ? "Created" : "Failed to create") + " directory: " + deptDir.getAbsolutePath());
-            }
+                File deptDir = new File(baseDir, department);
+                if (!deptDir.exists()) {
+                    boolean created = deptDir.mkdirs();
+                    System.out.println("[NODE] " + (created ? "Created" : "Failed to create") + " directory: " + deptDir.getAbsolutePath());
+                }
 
-            File file = new File(deptDir, filename);
-            try (FileOutputStream fos = new FileOutputStream(file)) {
-                fos.write(content);
-                out.writeBoolean(true);
-                out.flush();
-                System.out.println("[NODE] File " + filename + " saved successfully");
-            } catch (IOException e) {
-                System.err.println("[NODE] Error writing file " + filename + ": " + e.getMessage());
-                out.writeBoolean(false);
-                out.flush();
+                File file = new File(deptDir, filename);
+                try (FileOutputStream fos = new FileOutputStream(file)) {
+                    fos.write(content);
+                    out.writeBoolean(true);
+                    out.flush();
+                    System.out.println("[NODE] File " + filename + " saved successfully");
+                } catch (IOException e) {
+                    System.err.println("[NODE] Error writing file " + filename + ": " + e.getMessage());
+                    out.writeBoolean(false);
+                    out.flush();
+                }
+            } finally {
+                lock.writeLock().unlock();
             }
         } catch (Exception e) {
             System.err.println("[NODE] Error in handleAddEditAction: " + e.getMessage());
@@ -257,58 +255,58 @@ class FileNodeServer {
             }
         }
     }
-
     private void handleDeleteAction(ObjectOutputStream out, String department, String filename) throws IOException {
-        File file = new File(new File(baseDir, department), filename);
-        boolean deleted = file.exists() && file.delete();
-        out.writeBoolean(deleted);
-        System.out.println("[NODE] Delete " + filename + " result: " + deleted);
-    }
+        String fileKey = department + "/" + filename;
+        ReentrantReadWriteLock lock = fileLocks.computeIfAbsent(fileKey, k -> new ReentrantReadWriteLock());
 
+        // Acquire write lock for delete operation
+        lock.writeLock().lock();
+        try {
+            File file = new File(new File(baseDir, department), filename);
+            boolean deleted = file.exists() && file.delete();
+            out.writeBoolean(deleted);
+            System.out.println("[NODE] Delete " + filename + " result: " + deleted);
+
+            // Clean up the lock if file is deleted
+            if (deleted) {
+                fileLocks.remove(fileKey);
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
     private void handleFetchAction(ObjectOutputStream out, String department, String filename) throws IOException {
-        System.out.println("[NODE] Fetch request for: " + department + "/" + filename);
+        String fileKey = department + "/" + filename;
+        ReentrantReadWriteLock lock = fileLocks.computeIfAbsent(fileKey, k -> new ReentrantReadWriteLock());
+
+        System.out.println("[NODE] Fetch request for: " + fileKey);
         File deptDir = new File(baseDir, department);
         File targetFile = new File(deptDir, filename);
 
-        if (targetFile.exists() && targetFile.isFile()) {
-            try {
-                byte[] data = Files.readAllBytes(targetFile.toPath());
-                System.out.println("[NODE] Sending " + data.length + " bytes");
-                out.writeObject(data);
-                out.flush();
-                System.out.println("[NODE] Successfully sent file data");
-            } catch (IOException e) {
-                System.err.println("[NODE] Error reading file: " + e.getMessage());
+        // Acquire read lock for fetch operation
+        lock.readLock().lock();
+        try {
+            if (targetFile.exists() && targetFile.isFile()) {
+                try {
+                    byte[] data = Files.readAllBytes(targetFile.toPath());
+                    System.out.println("[NODE] Sending " + data.length + " bytes");
+                    out.writeObject(data);
+                    out.flush();
+                    System.out.println("[NODE] Successfully sent file data");
+                } catch (IOException e) {
+                    System.err.println("[NODE] Error reading file: " + e.getMessage());
+                    out.writeObject(new byte[0]);
+                    out.flush();
+                }
+            } else {
+                System.out.println("[NODE] File not found");
                 out.writeObject(new byte[0]);
                 out.flush();
             }
-        } else {
-            System.out.println("[NODE] File not found");
-            out.writeObject(new byte[0]);
-            out.flush();
+        } finally {
+            lock.readLock().unlock();
         }
     }
-
-    public int getCurrentLoad() {
-        return activeConnections.get();
-    }
-
-    public void addArtificialLoad(int amount) {
-        artificialLoad.addAndGet(amount);
-    }
-
-    public void removeArtificialLoad(int amount) {
-        artificialLoad.updateAndGet(current -> Math.max(0, current - amount));
-    }
-
-    public void clearArtificialLoad() {
-        artificialLoad.set(0);
-    }
-
-    public int getArtificialLoad() {
-        return artificialLoad.get();
-    }
-
     public void start() throws IOException {
         startCleanupThread(); // Start the cleanup thread
         try (ServerSocket serverSocket = new ServerSocket(port)) {
@@ -359,14 +357,13 @@ class FileNodeServer {
             }
         }
     }
-
     private void cleanupConnection(Socket socket) {
         try {
             if (validConnections.getOrDefault(socket, false)) {
                 activeSockets.remove(socket);
                 if (activeConnections.get() > 0) {
                     int currentLoad = activeConnections.decrementAndGet();
-                  //  System.out.println("[NODE] Connection cleaned up. Current load: " + currentLoad);
+                    //  System.out.println("[NODE] Connection cleaned up. Current load: " + currentLoad);
                 }
             }
             connectionTimestamps.remove(socket);
@@ -386,7 +383,6 @@ class FileNodeServer {
             System.out.println("[NODE] Error cleaning up connection: " + e.getMessage());
         }
     }
-
     // Start connection cleanup thread with more frequent checks
     private void startCleanupThread() {
         Thread cleanupThread = new Thread(() -> {
@@ -411,7 +407,6 @@ class FileNodeServer {
         cleanupThread.setDaemon(true);
         cleanupThread.start();
     }
-
     public static void main(String[] args) {
         Map<Integer, NodeInfo> nodeMap = new ConcurrentHashMap<>();
         List<Integer> ports = List.of(5001, 5002, 5003);
@@ -463,7 +458,6 @@ class FileNodeServer {
             }
         }
     }
-
     private static void startNode(Scanner scanner, Map<Integer, FileNodeServer.NodeInfo> nodeMap, List<Integer> ports) {
         System.out.print("Enter node number (1-3): ");
         int num = Integer.parseInt(scanner.nextLine());
@@ -489,7 +483,6 @@ class FileNodeServer {
         nodeMap.put(port, new NodeInfo(t, server, ConcurrentHashMap.newKeySet()));
         System.out.println("Node " + num + " started.");
     }
-
     private static void stopNode(Scanner scanner, Map<Integer, FileNodeServer.NodeInfo> nodeMap, List<Integer> ports) {
         System.out.print("Enter node number (1-3): ");
         int num = Integer.parseInt(scanner.nextLine());
@@ -505,7 +498,6 @@ class FileNodeServer {
             System.out.println("Node " + num + " is not running.");
         }
     }
-
     private static void listNodes(Map<Integer, FileNodeServer.NodeInfo> nodeMap) {
         if (nodeMap.isEmpty()) {
             System.out.println("No active nodes.");
@@ -521,7 +513,6 @@ class FileNodeServer {
             });
         }
     }
-
     private static void shutdownAll(Map<Integer, FileNodeServer.NodeInfo> nodeMap) {
         System.out.println("Shutting down all nodes...");
         nodeMap.values().forEach(info -> {
