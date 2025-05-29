@@ -1,5 +1,8 @@
-package server;
-
+package server.services.file_operations;
+import server.services.auth.AuthServices;
+import server.utility.Config;
+import server.utility.LoadBalancer;
+import server.utility.NodeInfo;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
@@ -9,36 +12,24 @@ import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
-
-class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorService {
-    static class User {
-        String username, password, role, department;
-        User(String u, String p, String r, String d) {
-            username = u; password = p; role = r; department = d;
-        }
-    }
-    private final Map<String, User> users = new ConcurrentHashMap<>();
-    private final Map<String, String> activeTokens = new ConcurrentHashMap<>();
+import static server.utility.Config.HEALTH_CHECK_INTERVAL;
+import static server.utility.Config.LOAD_UPDATE_INTERVAL;
+public class FileOperationsServiceImpl extends UnicastRemoteObject implements FileOperationsService {
     private final Map<String, String> fileLocationMap = new ConcurrentHashMap<>();
     private final Map<Integer, NodeInfo> nodeInfoMap = new ConcurrentHashMap<>();
     private final LoadBalancer loadBalancer = new LoadBalancer();
     private Timer loadUpdateTimer;
     private Timer healthCheckTimer;
-    private final int MAX_RETRIES = 3;
-    private final int HEALTH_CHECK_INTERVAL = 5000; // 5 seconds
-    private final int CONNECTION_TIMEOUT = 3000; // 3 seconds
-    private final int SOCKET_TIMEOUT = 5000; // 5 seconds
-    private final int MAX_FAILURES = 3;
-    private final int LOAD_UPDATE_INTERVAL = 2000; // 2 seconds
     private final Map<Integer, Long> lastSuccessfulHealthCheck = new ConcurrentHashMap<>();
     private final Map<Integer, Long> lastSuccessfulLoadUpdate = new ConcurrentHashMap<>();
     private final Map<Integer, Integer> consecutiveFailures = new ConcurrentHashMap<>();
     private final Map<Integer, Boolean> nodeRecoveryInProgress = new ConcurrentHashMap<>();
     private final Map<String, String> fileEditLocks = new ConcurrentHashMap<>();
-    protected CoordinatorServiceImpl() throws RemoteException {
+    private final AuthServices authService;
+    public FileOperationsServiceImpl(AuthServices authService) throws RemoteException {
         super();
+        this.authService = authService;
         initializeNodes();
         startLoadUpdates();
         startHealthChecks();
@@ -84,8 +75,8 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             NodeInfo node = nodeInfoMap.get(i);
             if (node != null && node.isActive) {
                 try (Socket socket = new Socket()) {
-                    socket.connect(new InetSocketAddress(node.host, node.port), CONNECTION_TIMEOUT);
-                    socket.setSoTimeout(SOCKET_TIMEOUT);
+                    socket.connect(new InetSocketAddress(node.host, node.port), Config.CONNECTION_TIMEOUT);
+                    socket.setSoTimeout(Config.SOCKET_TIMEOUT);
                     socket.setKeepAlive(true);
                     socket.setTcpNoDelay(true);
                     socket.setReceiveBufferSize(8192);
@@ -125,8 +116,8 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             NodeInfo node = nodeInfoMap.get(nodeId);
             if (node != null) {
                 try (Socket socket = new Socket()) {
-                    socket.connect(new InetSocketAddress(node.host, node.port), CONNECTION_TIMEOUT);
-                    socket.setSoTimeout(SOCKET_TIMEOUT);
+                    socket.connect(new InetSocketAddress(node.host, node.port), Config.CONNECTION_TIMEOUT);
+                    socket.setSoTimeout(Config.SOCKET_TIMEOUT);
                     socket.setKeepAlive(true);
                     socket.setTcpNoDelay(true);
                     socket.setReceiveBufferSize(8192);
@@ -157,7 +148,7 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
                         System.err.println("[COORDINATOR] Node " + nodeId + " health check failed: " + e.getMessage() +
                                 " (Consecutive failures: " + failures + ")");
 
-                        if (failures >= MAX_FAILURES) {
+                        if (failures >= Config.MAX_FAILURES) {
                             System.err.println("[COORDINATOR] Node " + nodeId + " marked as offline after " + failures + " consecutive failures");
                             node.isActive = false;
                             node.currentLoad = 0; // Reset load when node goes offline
@@ -204,8 +195,8 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
                     String host = hostPort[0];
                     int port = Integer.parseInt(hostPort[1]);
                     try (Socket socket = new Socket()) {
-                        socket.connect(new InetSocketAddress(host, port), CONNECTION_TIMEOUT);
-                        socket.setSoTimeout(SOCKET_TIMEOUT);
+                        socket.connect(new InetSocketAddress(host, port), Config.CONNECTION_TIMEOUT);
+                        socket.setSoTimeout(Config.SOCKET_TIMEOUT);
                         ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
                         ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
                         out.writeUTF("fetch");
@@ -229,8 +220,8 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
                         NodeInfo node = nodeInfoMap.get(i);
                         if (node != null && node.isActive) {
                             try (Socket newSocket = new Socket()) {
-                                newSocket.connect(new InetSocketAddress(node.host, node.port), CONNECTION_TIMEOUT);
-                                newSocket.setSoTimeout(SOCKET_TIMEOUT);
+                                newSocket.connect(new InetSocketAddress(node.host, node.port), Config.CONNECTION_TIMEOUT);
+                                newSocket.setSoTimeout(Config.SOCKET_TIMEOUT);
                                 ObjectOutputStream newOut = new ObjectOutputStream(newSocket.getOutputStream());
                                 ObjectInputStream newIn = new ObjectInputStream(newSocket.getInputStream());
                                 newOut.writeUTF("add");
@@ -262,45 +253,8 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         nodeRecoveryInProgress.remove(failedNodeId);
     }
     @Override
-    public boolean registerUser(String token, String username, String password, String role, String department) throws RemoteException {
-        if (users.isEmpty() && username.equals("admin") && role.equals("manager")) {
-            users.put(username, new User(username, password, role, department));
-            return true;
-        }
-
-        List<String> allowedDepartments = List.of("QA", "Graphic", "Development", "general");
-        if (!allowedDepartments.contains(department)) return false;
-
-        String requester = activeTokens.get(token);
-        if (requester == null) return false;
-
-        User currentUser = users.get(requester);
-        if (currentUser == null || !currentUser.role.equals("manager")) return false;
-        if (users.containsKey(username)) return false;
-
-        users.put(username, new User(username, password, role, department));
-        return true;
-    }
-    @Override
-    public String login(String username, String password) throws RemoteException {
-        User user = users.get(username);
-        if (user == null || !user.password.equals(password)) return null;
-        String token = UUID.randomUUID().toString();
-        activeTokens.put(token, username);
-        return token;
-    }
-    @Override
-    public boolean hasPermission(String token, String action, String department) throws RemoteException {
-        String username = activeTokens.get(token);
-        if (username == null) return false;
-        User user = users.get(username);
-        if (user == null) return false;
-        if (user.role.equals("manager")) return true;
-        return user.department.equals(department) && List.of("add", "edit", "delete", "view").contains(action);
-    }
-    @Override
     public boolean sendFileCommand(String token, String action, String filename, String department, byte[] content) throws RemoteException {
-        if (!hasPermission(token, action, department)) {
+        if (!authService.hasPermission(token, action, department)) {
             System.out.println("[COORDINATOR] Permission denied for " + action + " operation in " + department);
             return false;
         }
@@ -317,7 +271,7 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             }
         }
 
-        while (retries < MAX_RETRIES) {
+        while (retries < Config.MAX_RETRIES) {
             // Get active nodes and their current loads
             List<Integer> activeNodes = new ArrayList<>();
             Map<Integer, Integer> nodeLoads = new HashMap<>();
@@ -435,12 +389,12 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
             }
         }
 
-        System.err.println("[COORDINATOR] Failed to execute " + action + " operation after " + MAX_RETRIES + " retries");
+        System.err.println("[COORDINATOR] Failed to execute " + action + " operation after " + Config.MAX_RETRIES + " retries");
         return false;
     }
     @Override
     public byte[] requestFile(String token, String filename, String department) throws RemoteException {
-        if (!hasPermission(token, "view", department)) {
+        if (!authService.hasPermission(token, "view", department)) {
             System.out.println("[COORDINATOR] Permission denied for " + department);
             return null;
         }
@@ -521,21 +475,8 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         return new byte[0];
     }
     @Override
-    public List<String> listUsers(String token) throws RemoteException {
-        String username = activeTokens.get(token);
-        if (username == null) return List.of("Access Denied: Invalid token");
-        User user = users.get(username);
-        if (!"manager".equals(user.role)) return List.of("Access Denied: Not a manager");
-
-        List<String> result = new ArrayList<>();
-        for (User u : users.values()) {
-            result.add("Username: " + u.username + ", Role: " + u.role + ", Department: " + u.department);
-        }
-        return result;
-    }
-    @Override
     public List<String> listFiles(String token, String department) throws RemoteException {
-        if (!hasPermission(token, "view", department)) {
+        if (!authService.hasPermission(token, "view", department)) {
             System.out.println("[COORDINATOR] Permission denied for user to view department: " + department);
             return List.of("Permission denied");
         }
@@ -634,49 +575,4 @@ class CoordinatorServiceImpl extends UnicastRemoteObject implements CoordinatorS
         }
         return false;
     }
-    private static class LoadBalancer {
-        private final Map<Integer, NodeStats> nodeStats = new ConcurrentHashMap<>();
-        private final List<Integer> availableNodes = new CopyOnWriteArrayList<>();
-        private final double CONNECTION_WEIGHT = 0.8; // Increased weight for connections
-        private final double RESPONSE_TIME_WEIGHT = 0.2; // Decreased weight for response time
-
-        public void addNode(int nodeId) {
-            nodeStats.putIfAbsent(nodeId, new NodeStats());
-            if (!availableNodes.contains(nodeId)) {
-                availableNodes.add(nodeId);
-            }
-        }
-
-
-        private static class NodeStats {
-            int activeConnections;
-            double avgResponseTime;
-            int completedRequests;
-
-            public NodeStats() {
-                this.activeConnections = 0;
-                this.avgResponseTime = 0;
-                this.completedRequests = 0;
-            }
-        }
-    }
-    private static class NodeInfo {
-        String host;
-        int port;
-        AtomicInteger activeConnections;
-        boolean isActive;
-        int currentLoad;
-        int failureCount;
-
-        public NodeInfo(String host, int port, AtomicInteger activeConnections, boolean isActive) {
-            this.host = host;
-            this.port = port;
-            this.activeConnections = activeConnections;
-            this.isActive = isActive;
-            this.currentLoad = 0;
-            this.failureCount = 0;
-        }
-    }
 }
-
-

@@ -1,6 +1,7 @@
 package client;
 
-import server.CoordinatorService;
+import server.services.auth.AuthServices;
+import server.services.file_operations.FileOperationsService;
 import java.io.*;
 import java.net.Socket;
 import java.rmi.registry.LocateRegistry;
@@ -9,7 +10,6 @@ import java.util.*;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.net.InetSocketAddress;
 
 public class TestClient {
     private static final List<String> ALLOWED_DEPARTMENTS = List.of("QA", "Graphic", "Development", "general");
@@ -18,16 +18,9 @@ public class TestClient {
     // Track active load connections
     private static final List<LoadConnection> activeConnections = new ArrayList<>();
     private static final AtomicBoolean stopRequested = new AtomicBoolean(false);
-    private static class LoadConnection {
-        final Thread thread;
-        final Socket socket;
-
-        public LoadConnection(Thread thread, Socket socket) {
-            this.thread = thread;
-            this.socket = socket;
-        }
+    private record LoadConnection(Thread thread, Socket socket) {
     }
-    private static void createRealLoad(Scanner scanner, CoordinatorService service) {
+    private static void createRealLoad(Scanner scanner, FileOperationsService service) {
         try {
             System.out.print("Enter node port (5001/5002/5003): ");
             int port = Integer.parseInt(scanner.nextLine());
@@ -100,17 +93,19 @@ public class TestClient {
     public static void main(String[] args) {
         try (Scanner scanner = new Scanner(System.in)) {
             Registry registry = LocateRegistry.getRegistry("localhost", 1099);
-            CoordinatorService service = (CoordinatorService) registry.lookup("CoordinatorService");
+            FileOperationsService service = (FileOperationsService) registry.lookup("CoordinatorService");
+            AuthServices authServices = (AuthServices) registry.lookup("AuthServices");
+
 
             // Try to login as admin first
-            String token = service.login("admin", "admin123");
+            String token = authServices.login("admin", "admin123");
 
             // If admin doesn't exist, create it
             if (token == null) {
                 System.out.println("Admin account not found. Creating default admin...");
-                boolean created = service.registerUser("", "admin", "admin123", "manager", "general");
+                boolean created = authServices.registerUser("", "admin", "admin123", "manager", "general");
                 if (created) {
-                    token = service.login("admin", "admin123");
+                    token = authServices.login("admin", "admin123");
                     System.out.println("Default admin created successfully!");
                 } else {
                     System.out.println("Failed to create admin account!");
@@ -153,7 +148,7 @@ public class TestClient {
 
                         case 3: // User management (admin only)
                             if (currentRole.equals("manager")) {
-                                handleUserManagement(scanner, service, token);
+                                handleUserManagement(scanner, authServices, token);
                             } else {
                                 System.out.println("Access denied!");
                             }
@@ -161,7 +156,7 @@ public class TestClient {
 
                         case 4: // List users (admin only)
                             if (currentRole.equals("manager")) {
-                                listAllUsers(service, token);
+                                listAllUsers(authServices, token);
                             } else {
                                 System.out.println("Access denied!");
                             }
@@ -173,7 +168,7 @@ public class TestClient {
                             break;
 
                         case 0: // Logout
-                            token = showLoginScreen(scanner, service);
+                            token = showLoginScreen(scanner, authServices);
                             if (token == null) return;
                             break;
 
@@ -189,7 +184,7 @@ public class TestClient {
             e.printStackTrace();
         }
     }
-    private static String showLoginScreen(Scanner scanner, CoordinatorService service) throws Exception {
+    private static String showLoginScreen(Scanner scanner, AuthServices service) throws Exception {
         while (true) {
             System.out.println("\n=== Distributed File System ===");
             System.out.println("1) Admin Login");
@@ -238,7 +233,7 @@ public class TestClient {
             }
         }
     }
-    private static void handleFileDownloadWithList(Scanner scanner, CoordinatorService service, String token) {
+    private static void handleFileDownloadWithList(Scanner scanner, FileOperationsService service, String token) {
         try {
             // Get department
             String department;
@@ -303,7 +298,7 @@ public class TestClient {
             System.out.println("Error during download: " + e.getMessage());
         }
     }
-    private static void handleFileOperations(Scanner scanner, CoordinatorService service, String token) throws Exception {
+    private static void handleFileOperations(Scanner scanner, FileOperationsService service, String token) throws Exception {
         System.out.println("\n=== File Operations ===");
         System.out.print("Action (add/edit/delete/list): ");
         String action = scanner.nextLine().toLowerCase();
@@ -418,7 +413,7 @@ public class TestClient {
         boolean result = service.sendFileCommand(token, action, filename, department, content);
         System.out.println(result ? "Operation successful!" : "Operation failed (check permissions)");
     }
-    private static void handleUserManagement(Scanner scanner, CoordinatorService service, String token) throws Exception {
+    private static void handleUserManagement(Scanner scanner, AuthServices service, String token) throws Exception {
         System.out.println("\n=== User Management ===");
         System.out.print("Username: ");
         String username = scanner.nextLine();
@@ -436,7 +431,7 @@ public class TestClient {
         boolean success = service.registerUser(token, username, password, role, department);
         System.out.println(success ? "User registered successfully!" : "Registration failed!");
     }
-    private static void listAllUsers(CoordinatorService service, String token) throws Exception {
+    private static void listAllUsers(AuthServices service, String token) throws Exception {
         System.out.println("\n=== User List ===");
         List<String> users = service.listUsers(token);
         if (users.isEmpty() || users.get(0).contains("Access Denied")) {

@@ -207,6 +207,7 @@ class FileNodeServer {
     }
     private void handleAddEditAction(ObjectInputStream in, ObjectOutputStream out, String department, String filename) throws Exception {
         String fileKey = department + "/" + filename;
+        //a Write Lock for This File
         ReentrantReadWriteLock lock = fileLocks.computeIfAbsent(fileKey, k -> new ReentrantReadWriteLock());
 
         try {
@@ -216,7 +217,7 @@ class FileNodeServer {
             // Acquire write lock for add/edit operations
             lock.writeLock().lock();
             try {
-                byte[] content = (byte[]) in.readObject();
+                byte[] content = (byte[]) in.readObject(); //Receive File Content From Client
                 if (content == null) {
                     System.out.println("[NODE] Received null content for file operation");
                     out.writeBoolean(false);
@@ -336,8 +337,6 @@ class FileNodeServer {
                     socket.setReuseAddress(true);
                     socket.setSoLinger(true, 5);
 
-//                    System.out.println("[NODE] New connection accepted. Current load: " + activeConnections.get() +
-//                            " (Total connections: " + totalConnections.get() + ")");
 
                     threadPool.execute(() -> handleClient(socket));
                 } catch (SocketTimeoutException e) {
