@@ -3,6 +3,7 @@ package client;
 import server.services.auth.AuthServices;
 import server.services.file_operations.FileOperationsService;
 import java.io.*;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
@@ -24,6 +25,12 @@ public class TestClient {
         try {
             System.out.print("Enter node port (5001/5002/5003): ");
             int port = Integer.parseInt(scanner.nextLine());
+
+            // ✅ Check if the port is active before continuing
+            if (!isPortOpen("localhost", port, 2000)) {
+                System.out.println("❌ Node on port " + port + " is not active. Please start the node first.");
+                return;
+            }
 
             System.out.print("Number of parallel connections to create: ");
             int connections = Integer.parseInt(scanner.nextLine());
@@ -52,10 +59,9 @@ public class TestClient {
                                 out.flush();
                                 String resp = in.readUTF();
                                 if (!"pong".equals(resp)) break;
-                                Thread.sleep(2000); // 2 seconds between pings
+                                Thread.sleep(2000);
                             }
                         } catch (Exception e) {
-                            // Optionally print/log error
                             try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
                         } finally {
                             removeConnection(Thread.currentThread());
@@ -65,11 +71,21 @@ public class TestClient {
                 t.start();
             }
 
-            System.out.println("Load generation started. Use option 6 to stop early.");
+            System.out.println("✅ Load generation started. Use option 6 to stop early.");
         } catch (Exception e) {
-            System.out.println("Error creating load: " + e.getMessage());
+            System.out.println("❌ Error creating load: " + e.getMessage());
         }
     }
+    private static boolean isPortOpen(String host, int port, int timeoutMillis) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(host, port), timeoutMillis);
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+
     private static void clearActiveConnections() {
         synchronized (activeConnections) {
             for (LoadConnection conn : activeConnections) {
