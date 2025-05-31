@@ -61,6 +61,7 @@ public class AuthServicesImpl   extends UnicastRemoteObject implements AuthServi
         User user = users.get(username);
         if (user == null) return false;
         if (user.role.equals("manager")) return true;
-        return user.department.equals(department) && List.of("add", "edit", "delete", "view").contains(action);
+        return user.department.trim().equalsIgnoreCase(department.trim()) &&
+                List.of("add", "edit", "delete", "view").contains(action.toLowerCase());
     }
 }

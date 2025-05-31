@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-class FileNodeServer {
+class   FileNodeServer {
     private final int port;
     private final File baseDir;
     private volatile boolean isOnline = true;
@@ -264,15 +264,22 @@ class FileNodeServer {
         lock.writeLock().lock();
         try {
             File file = new File(new File(baseDir, department), filename);
-            boolean deleted = file.exists() && file.delete();
-            out.writeBoolean(deleted);
-            System.out.println("[NODE] Delete " + filename + " result: " + deleted);
 
-            // Clean up the lock if file is deleted
-            if (deleted) {
-                fileLocks.remove(fileKey);
-            }
-        } finally {
+            boolean deleted = file.delete();
+
+            out.writeBoolean(deleted);
+            fileLocks.remove(fileKey);
+            System.out.println("[NODE] Delete " + filename + " result: " + deleted);
+            out.flush();
+
+        }
+
+        catch (Exception e) {
+            System.err.println("[NODE] Exception during delete: " + e.getMessage());
+            e.printStackTrace();
+            out.writeBoolean(false); // Avoid breaking the client
+        }
+        finally {
             lock.writeLock().unlock();
         }
     }
