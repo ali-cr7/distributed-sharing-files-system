@@ -215,10 +215,18 @@ public class FileOperationsServiceImpl extends UnicastRemoteObject implements Fi
             }
             // If recovered, redistribute to another active node
             if (data != null && data.length > 0) {
+                Set<String> updatedLocs = new HashSet<>(Arrays.asList(locations));
+                updatedLocs.remove(failedNodeAddress); // Remove the failed one
+
                 for (int i = 0; i < nodeInfoMap.size(); i++) {
                     if (i != failedNodeId) {
                         NodeInfo node = nodeInfoMap.get(i);
                         if (node != null && node.isActive) {
+                            String newLoc = node.host + ":" + node.port;
+
+                            // ✅ Avoid re-sending to a node that already has the file
+                            if (updatedLocs.contains(newLoc)) continue;
+
                             try (Socket newSocket = new Socket()) {
                                 newSocket.connect(new InetSocketAddress(node.host, node.port), Config.CONNECTION_TIMEOUT);
                                 newSocket.setSoTimeout(Config.SOCKET_TIMEOUT);
@@ -231,14 +239,10 @@ public class FileOperationsServiceImpl extends UnicastRemoteObject implements Fi
                                 newOut.flush();
                                 boolean success = newIn.readBoolean();
                                 if (success) {
-                                    // Update fileLocationMap to include the new node
-                                    String newLoc = node.host + ":" + node.port;
-                                    Set<String> updatedLocs = new HashSet<>(Arrays.asList(locations));
                                     updatedLocs.add(newLoc);
-                                    updatedLocs.remove(failedNodeAddress);
-                                    fileLocationMap.put(fileKey, String.join(",", updatedLocs));
                                     System.out.println("[COORDINATOR] Successfully redistributed file " + filename + " to node " + i);
-                                    break;
+                                } else {
+                                    System.err.println("[COORDINATOR] Node " + i + " failed to accept file " + filename);
                                 }
                             } catch (Exception e) {
                                 System.err.println("[COORDINATOR] Failed to redistribute file " + filename + " to node " + i);
@@ -246,7 +250,11 @@ public class FileOperationsServiceImpl extends UnicastRemoteObject implements Fi
                         }
                     }
                 }
-            } else {
+
+                // 🔄 Update fileLocationMap after all attempts
+                fileLocationMap.put(fileKey, String.join(",", updatedLocs));
+            }
+            else {
                 System.err.println("[COORDINATOR] Failed to recover file " + filename + " from any backup node");
             }
         }
@@ -394,10 +402,10 @@ public class FileOperationsServiceImpl extends UnicastRemoteObject implements Fi
     }
     @Override
     public byte[] requestFile(String token, String filename, String department) throws RemoteException {
-        if (!authService.hasPermission(token, "view", department)) {
-            System.out.println("[COORDINATOR] Permission denied for " + department);
-            return null;
-        }
+//        if (!authService.hasPermission(token, "view", department)) {
+//            System.out.println("[COORDINATOR] Permission denied for " + department);
+//            return null;
+//        }
 
         String key = department + "/" + filename;
         String locationList = fileLocationMap.get(key);
@@ -476,10 +484,10 @@ public class FileOperationsServiceImpl extends UnicastRemoteObject implements Fi
     }
     @Override
     public List<String> listFiles(String token, String department) throws RemoteException {
-        if (!authService.hasPermission(token, "view", department)) {
-            System.out.println("[COORDINATOR] Permission denied for user to view department: " + department);
-            return List.of("Permission denied");
-        }
+//        if (!authService.hasPermission(token, "view", department)) {
+//            System.out.println("[COORDINATOR] Permission denied for user to view department: " + department);
+//            return List.of("Permission denied");
+//        }
 
         System.out.println("[COORDINATOR] Attempting to list files in " + department);
         List<String> result = new ArrayList<>();

@@ -5,6 +5,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.file.Files;
+import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -142,6 +143,11 @@ class   FileNodeServer {
                 case "add", "edit" -> handleAddEditAction(in, out, department, filename);
                 case "delete" -> handleDeleteAction(out, department, filename);
                 case "fetch" -> handleFetchAction(out, department, filename);
+
+
+
+
+
                 default -> {
                     System.out.println("[NODE] Invalid action: " + action);
                     out.writeBoolean(false);
@@ -526,4 +532,7 @@ class   FileNodeServer {
             info.thread().interrupt();
         });
     }
+
+
+
 }
